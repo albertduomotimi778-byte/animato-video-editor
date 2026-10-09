@@ -576,6 +576,18 @@ def cmd_serve(_args):
         threading.Thread(target=loading_beat, daemon=True).start()
     try:
         proc, base, _ = start_server(repo, ckpt, key, 8011, False)
+    except Exception as err:
+        loading["on"] = False
+        # Tell the app right away so the song shows the real reason instead of "warming up" forever.
+        reason = str(err).strip().splitlines()
+        short = next((x for x in reversed(reason) if x.strip() and not x.startswith(" ")), "the music engine could not start")
+        log("ready", f"the music engine could not start: {err}")
+        if app and token:
+            try:
+                app_call(app, "POST", "/api/music/runner/fail", {"token": token, "error": ("The music engine on your GitHub runner could not start: " + short)[:280]}, timeout=20)
+            except Exception:
+                pass
+        raise
     finally:
         loading["on"] = False
     if warm_only:
@@ -647,7 +659,7 @@ def cmd_serve(_args):
             state["done"] = True
             log("composing", f"song {jid} failed: {err}")
             try:
-                app_call(app, "POST", "/api/music/runner/update", {"token": token, "id": jid, "patch": {"state": "error", "error": "The song could not be made this time. Please try again."}}, timeout=20)
+                app_call(app, "POST", "/api/music/runner/update", {"token": token, "id": jid, "patch": {"state": "error", "error": ("The song could not be made: " + str(err).strip().splitlines()[-1] if str(err).strip() else "The song could not be made this time. Please try again.")[:280]}}, timeout=20)
             except Exception:
                 pass
         last_work = time.time()

@@ -3873,10 +3873,24 @@ async function transcribeLocal(file: string): Promise<Word[]> {
   }
   const py = path.join(WORK_DIR, 'lyrics_asr.py');
   fs.writeFileSync(py, `import json,sys,os
+import av as _av
+_av_open=_av.open
+def _open(*a,**k):
+  k.pop("metadata_errors",None)
+  return _av_open(*a,**k)
+_av.open=_open
+def _pcm(p):
+  import subprocess,numpy as np
+  try:
+    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
+    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
+    return a if a.size>1600 else p
+  except Exception:
+    return p
 from faster_whisper import WhisperModel
 m=WhisperModel("small",device="cpu",compute_type="int8",cpu_threads=os.cpu_count() or 2)
 lang=sys.argv[2] if len(sys.argv)>2 and sys.argv[2] not in ("","unknown","pcm") else None
-segs,_=m.transcribe(sys.argv[1],word_timestamps=True,vad_filter=False,language=lang)
+segs,_=m.transcribe(_pcm(sys.argv[1]),word_timestamps=True,vad_filter=False,language=lang)
 out=[]
 for s in segs:
   for w in (s.words or []): out.append({"text":w.word.strip(),"start":w.start,"end":w.end})
@@ -4197,10 +4211,24 @@ async function transcribeVoice(audio: string, hint: string): Promise<Word[] | nu
   }
   const script = path.join(WORK_DIR, 'studio_asr.py');
   fs.writeFileSync(script, `import json,sys
+import av as _av
+_av_open=_av.open
+def _open(*a,**k):
+  k.pop("metadata_errors",None)
+  return _av_open(*a,**k)
+_av.open=_open
+def _pcm(p):
+  import subprocess,numpy as np
+  try:
+    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
+    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
+    return a if a.size>1600 else p
+  except Exception:
+    return p
 from faster_whisper import WhisperModel
 audio,hint,out=sys.argv[1],sys.argv[2],sys.argv[3]
 m=WhisperModel("base",device="cpu",compute_type="int8",cpu_threads=4)
-segs,info=m.transcribe(audio,word_timestamps=True,beam_size=1,condition_on_previous_text=False,initial_prompt=(hint or None))
+segs,info=m.transcribe(_pcm(audio),word_timestamps=True,beam_size=1,condition_on_previous_text=False,initial_prompt=(hint or None))
 words=[]
 for s in segs:
   for w in (s.words or []):

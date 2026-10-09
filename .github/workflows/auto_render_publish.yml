@@ -104,7 +104,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/acestep-local
-          key: animato-acestep-local-v1-${{ runner.os }}
+          key: animato-acestep-local-v2-${{ runner.os }}
 
       # Scene pictures are FOUND on the web (cartoon illustrations for stories, licensed
       # photos for everything else) — nothing is generated on this CPU, so there is no

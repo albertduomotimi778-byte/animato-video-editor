@@ -89,7 +89,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/acestep-local
-          key: animato-acestep-local-v1-${{ runner.os }}
+          key: animato-acestep-local-v2-${{ runner.os }}
 
       - name: Install the music engine (first run only)
         run: bash animato-cloud/music_setup.sh

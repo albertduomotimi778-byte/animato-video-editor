@@ -64,6 +64,15 @@ def whisper():
     global _whisper
     with _whisper_lock:
         if _whisper is None:
+            try:
+                import av as _av
+                _o = _av.open
+                def _open(*a, **k):
+                    k.pop("metadata_errors", None)  # removed in newer PyAV; faster-whisper still passes it
+                    return _o(*a, **k)
+                _av.open = _open
+            except Exception:
+                pass
             from faster_whisper import WhisperModel
             _whisper = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=2)
             log("Whisper loaded")
