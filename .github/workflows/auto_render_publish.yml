@@ -87,6 +87,7 @@ jobs:
           python-version: '3.12'
 
       - name: Cache the vocal separator (Musical automations)
+        if: ${{ (github.event.client_payload.job.category || inputs.category) == 'musical' }}
         uses: actions/cache@v4
         with:
           path: |
@@ -95,6 +96,7 @@ jobs:
           key: animato-demucs-v1-${{ runner.os }}
 
       - name: Cache ACE-Step (the music engine runs on this runner)
+        if: ${{ (github.event.client_payload.job.category || inputs.category) == 'musical' }}
         uses: actions/cache@v4
         with:
           path: ~/acestep-local
@@ -139,17 +141,21 @@ jobs:
           "$VENV/bin/python" -c "import torch, diffusers; print('image generator ready: torch', torch.__version__, 'diffusers', diffusers.__version__)"
 
       # The app's own AI model (llama.cpp + Qwen3-4B) runs on this runner: no API keys.
+      # Studio animations that bring their own words skip the writer model (much faster start).
       - name: Cache the AI model
+        if: ${{ !github.event.client_payload.job.studio_needs || github.event.client_payload.job.studio_needs == 'llm' }}
         uses: actions/cache@v4
         with:
           path: ~/animato-llm
           key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
 
       - name: Start the AI model (self-hosted)
+        if: ${{ !github.event.client_payload.job.studio_needs || github.event.client_payload.job.studio_needs == 'llm' }}
         run: bash animato-cloud/llm_server.sh
 
       # Studio animations made from the user's own voice: speech recognition (installed on first use).
       - name: Cache speech recognition
+        if: ${{ github.event.client_payload.job.studio_job != '' && github.event.client_payload.job.studio_job != null }}
         uses: actions/cache@v4
         with:
           path: ~/asr-venv

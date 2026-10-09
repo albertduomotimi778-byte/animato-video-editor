@@ -99,7 +99,7 @@ function podcastLanguage(CFG: any): { key: string; name: string; female: string[
 }
 
 export const EMO_TAGS = ['neutral', 'happy', 'excited', 'sad', 'crying', 'serious', 'worried', 'scared', 'surprised', 'angry', 'calm', 'curious', 'laugh'];
-export const GESTURE_TAGS = ['look_left', 'look_right', 'look_up', 'think', 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'wave', 'shrug', 'hands_up', 'hand_chest', 'fist'];
+export const GESTURE_TAGS = ['look_left', 'look_right', 'look_up', 'think', 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'wave', 'shrug', 'hands_up', 'hand_chest', 'fist', 'turn_left', 'turn_right', 'side_left', 'side_right', 'turn_around', 'face_front', 'look_down'];
 const ALL_TAGS = new Set([...EMO_TAGS, ...GESTURE_TAGS]);
 
 /** "[happy] Hello there [nod] friend" → text + tags at word indexes. */
@@ -438,7 +438,7 @@ ${songs.length ? songs.map((x, i) => `${i + 1}. "${x.title}"${x.genre ? ` (${x.g
 INTERVIEW: for every song the hosts ask about the INSPIRATION — the moment, person or feeling behind it, what the lyrics really mean (she may quote one short line ONLY from the lyrics given above), how the band and backup singers built it, and how the crowd reacted at the concert. Follow-up questions, laughs and honest emotion. ${star.name} speaks about 45% of the lines, each host about a quarter. End with what she is working on next, the hosts thank ${star.name} by name and ask viewers to follow.
 Never invent awards, chart positions, sales or real collaborators.
 ` : ''}${about && !CFG.topic && !singerMode ? `ANGLE: a roundup of the latest in ${about} — what just happened, why it matters, the hosts' honest takes, and bold predictions about the next big thing (clearly framed as speculation).\n` : ''}HOW IT SOUNDS: a real conversation between friends who know the subject — quick back-and-forth, reactions ("wait, really?"), a disagreement, a laugh, a clear takeaway. Short lines (one or two sentences each). Line 1 is a HOOK (a surprising fact or bold opinion, max 14 words). The last line thanks the audience and asks them to follow.
-Performance tags (optional, before the word they apply to): ${[...EMO_TAGS, 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'shrug', 'hands_up', 'hand_chest', 'think'].map((t) => `[${t}]`).join(' ')}.
+Performance tags (optional, before the word they apply to): ${[...EMO_TAGS, 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'shrug', 'hands_up', 'hand_chest', 'think', 'turn_left', 'turn_right', 'side_left', 'side_right', 'turn_around', 'face_front'].map((t) => `[${t}]`).join(' ')}.
 ${CFG.performanceNotes ? `WHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}\n` : ''}LENGTH: ${n}.
 ${foreign
   ? `Return ONLY JSON: {"title": "catchy episode title in ${lang!.name} (max 60 chars)", "title_en": "the same title in English", "description": "2-3 sentences for YouTube, in English", "hashtags": ["5-8 specific hashtags without #"], "lines": [{"host": 1, "text": "[excited] the line in ${lang!.name}", "en": "the English translation"}]}`
@@ -572,7 +572,7 @@ RULES
 - Locations (use these ids only): ${FILM_LOCATIONS.join(', ')}. Each scene has "time": "day" or "night", and a short "card" like "Maya's bedroom — 2 a.m.".
 - "cast": the ids of the characters on screen in that scene (1-3). Only cast members speak, plus an optional "narrator" (use the narrator for at most one line per scene).
 - Each character: id (c1, c2…), name, gender (female|male), and "look": a short visual description the animator uses — hair (style + colour), skin tone, clothes with colours, glasses/beard if any (e.g. "curly black hair, dark skin, yellow hoodie, round glasses").
-- Lines are short and natural (max 2 sentences). Performance tags before words: ${[...EMO_TAGS, 'nod', 'shake_head', 'think', 'shrug', 'hands_up', 'hand_chest', 'point', 'fist', 'wave'].map((t) => `[${t}]`).join(' ')}.
+- Lines are short and natural (max 2 sentences). Performance tags before words: ${[...EMO_TAGS, 'nod', 'shake_head', 'think', 'shrug', 'hands_up', 'hand_chest', 'point', 'fist', 'wave', 'turn_left', 'turn_right', 'side_left', 'side_right', 'turn_around', 'face_front'].map((t) => `[${t}]`).join(' ')}.
 - Scene 1 opens with a hook. The final scene resolves the story.
 - Characters move like in a real film: they arrive, cross the room, leave. Write scenes so people can walk in and out (e.g. someone arrives mid-scene, someone storms off).
 - LENGTH: ${size}.

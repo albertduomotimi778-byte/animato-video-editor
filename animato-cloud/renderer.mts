@@ -158,6 +158,8 @@ const CFG = {
   presenterName: pick(JOB.presenter_name, ENV.PRESENTER_NAME),
   /** What is working on this channel (real YouTube numbers) — the writer leans into it. */
   performanceNotes: [pick(JOB.performance_notes, ENV.PERFORMANCE_NOTES), pick(JOB.creative_angle) ? `THIS VIDEO'S CREATIVE ANGLE (make it feel fresh — never a generic take): ${pick(JOB.creative_angle)}.` : ''].filter(Boolean).join('\n'),
+  /** Stories without a presenter on screen (pictures + voice-over). */
+  noCharacter: pick(JOB.no_character) === 'true',
   /** Titles other creators made recently in this category (across the app) — never repeat or closely copy them. */
   globalTitles: String(pick(JOB.global_titles) || '').split('\n').map((x) => x.trim()).filter(Boolean).slice(-50),
   /** Podcasts: 'auto' = brand-new hosts every episode (podcastCastCount of them, besides the presenter in guest mode). */
@@ -211,7 +213,7 @@ const CFG = {
 interface StudioJob {
   id: string; kind: string; title: string; script: string; voiceUrl: string; voiceGender: 'female' | 'male';
   cast: { name: string; gender: 'female' | 'male'; spec: any }[]; watermark: boolean; maxSeconds: number;
-  location: string; time: 'day' | 'night'; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
+  location: string; time: 'day' | 'night'; showCharacter: boolean; fast: boolean; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
 }
 const STUDIO: StudioJob | null = (() => {
   const s = parseSpec(JOB.studio_job);
@@ -222,7 +224,7 @@ const STUDIO: StudioJob | null = (() => {
     script: String(s.script || '').slice(0, 6000), voiceUrl: String(s.voiceUrl || ''), voiceGender: gender(s.voiceGender),
     cast: (Array.isArray(s.cast) ? s.cast : []).slice(0, 3).map((c: any, i: number) => ({ name: String(c?.name || `Character ${i + 1}`).slice(0, 24), gender: gender(c?.gender), spec: c?.spec || null })),
     watermark: s.watermark !== false, maxSeconds: Math.max(15, Math.min(300, Number(s.maxSeconds) || 60)),
-    location: String(s.location || 'living_room'), time: s.time === 'night' ? 'night' : 'day',
+    location: String(s.location || 'living_room'), time: s.time === 'night' ? 'night' : 'day', showCharacter: s.showCharacter !== false, fast: s.fast === true,
     scenes: Array.isArray(s.scenes) ? s.scenes.slice(0, 8) : [],
   };
 })();
@@ -245,7 +247,8 @@ const WANT = { youtube: CFG.targets.has('youtube'), facebook: CFG.targets.has('f
 const PUBLISH = WANT.youtube || WANT.facebook || WANT.instagram || WANT.threads;
 let SOCIAL: Record<string, any> = {};
 
-const [W, H] = DIMENSIONS[CFG.aspect];
+// Studio animations on the Free plan render at 720p: about twice as fast, still sharp on a phone.
+const [W, H] = STUDIO?.fast ? (DIMENSIONS[CFG.aspect].map((v) => Math.round((v * 2) / 3 / 2) * 2) as [number, number]) : DIMENSIONS[CFG.aspect];
 const FRAME_W = W, FRAME_H = H;
 const FPS = 30;
 /** Minutes left before GitHub stops the job (JOB_TIMEOUT_MINUTES, default 60, minus setup time already used). */
@@ -554,7 +557,8 @@ interface Scene { narration: string; shot: 'scene' | 'panel' | 'full'; emotion: 
 // ---------------------------------------------------------------------------
 const EMOTION_TAGS = ['neutral', 'happy', 'excited', 'sad', 'crying', 'serious', 'worried', 'scared', 'surprised', 'angry', 'calm', 'curious', 'laugh'];
 const GESTURE_TAGS = ['look_image', 'look_left', 'look_right', 'look_up', 'think', 'nod', 'shake_head', 'lean_in',
-  'point', 'explain', 'count', 'wave', 'shrug', 'hands_up', 'hand_chest', 'fist'];
+  'point', 'explain', 'count', 'wave', 'shrug', 'hands_up', 'hand_chest', 'fist',
+  'turn_left', 'turn_right', 'side_left', 'side_right', 'turn_around', 'face_front', 'look_down'];
 const TAG_ALIASES: Record<string, string> = {
   joy: 'happy', joyful: 'happy', smile: 'happy', smiling: 'happy', cheerful: 'happy', warm: 'happy', amused: 'happy', hopeful: 'happy', proud: 'happy', relieved: 'happy',
   excitement: 'excited', thrilled: 'excited', enthusiastic: 'excited', energetic: 'excited',
@@ -571,6 +575,7 @@ const TAG_ALIASES: Record<string, string> = {
   shrugging: 'shrug', dunno: 'shrug', whoa: 'hands_up', hands_up: 'hands_up', raise_hands: 'hands_up', heart: 'hand_chest', hand_on_heart: 'hand_chest', chest: 'hand_chest',
   fist_pump: 'fist', clenched: 'fist', laughing: 'laugh', laughs: 'laugh', haha: 'laugh', giggle: 'laugh', chuckle: 'laugh', chuckles: 'laugh', grin: 'happy',
   glance_left: 'look_left', glance_right: 'look_right', look_away: 'look_left', thinking: 'think', ponder: 'think', hmm: 'think',
+  turn_back: 'turn_around', back: 'turn_around', walk_away: 'turn_around', profile: 'side_right', profile_left: 'side_left', profile_right: 'side_right', face_camera: 'face_front', front: 'face_front', turn_to_camera: 'face_front', bow_head: 'look_down', head_down: 'look_down',
   shake: 'shake_head', head_shake: 'shake_head', no: 'shake_head', yes: 'nod', nodding: 'nod', lean: 'lean_in', lean_forward: 'lean_in', whisper: 'lean_in'
 };
 
@@ -917,7 +922,7 @@ RULES
 PERFORMANCE TAGS (the presenter is an animated character with a face, head, arms and hands; it performs tags you write INSIDE "narration")
 - Put a tag right before the word where the change should land. Tags are never spoken or shown as captions.
 - Emotion tags (the face keeps it until the next emotion tag): [neutral] [calm] [happy] [excited] [curious] [serious] [worried] [scared] [surprised] [sad] [crying] [angry] [laugh]
-- Head/eye tags: [look_image] turn and look at the picture, [look_left] [look_right] glance aside, [look_up], [think] ponder, [nod], [shake_head], [lean_in] for a secret or key point.
+- Head/eye tags: [look_image] turn and look at the picture, [look_left] [look_right] glance aside, [look_up], [think] ponder, [nod], [shake_head], [lean_in] for a secret or key point. Body turns (use sparingly, at most one per scene, for drama): [turn_left] [turn_right] three-quarter turn, [side_left] [side_right] profile, [turn_around] back to camera (e.g. walking away, a reveal), [face_front] back to the viewer, [look_down].
 - Hand/body tags: [point] point at the picture on screen, [explain] open-palm explaining gesture, [count] hold up a finger for a step or item, [wave] wave hello/goodbye, [shrug] "who knows?", [hands_up] "whoa!", [hand_chest] heartfelt/sad, [fist] determined/emphasis.
 - Start EVERY scene with an emotion tag and change emotion whenever the feeling of the words changes, exactly like a real presenter. Use [laugh] only for genuinely funny moments and [crying] only for truly heartbreaking ones.
 - Example: "[serious] Heavy rain flooded the coast overnight. [point] This is Main Street this morning. [happy] But the good news? [nod] The weekend looks sunny." / tutorial: "[explain] First, open the app. [count] Step one: upload your photo."
@@ -1358,6 +1363,21 @@ async function generateScript(pastStory: string, pastTitles: string[], pastSourc
   } else {
     lastError = 'offline test mode';
   }
+  // Small models are far more reliable writing one short scene at a time than one long JSON:
+  // plan the scenes first, then write each scene's narration separately.
+  if (!CFG.offline && LLM.hasKeys && (!nearMiss || nearMiss.words < lengthSpec().minWords)) {
+    try {
+      const sb = await sceneByScene(system, prompt);
+      if (sb) {
+        const sc = normaliseScript(sb, 'local/scene-by-scene', true);
+        withSources(sc);
+        if (groundScript(sc, pack)) {
+          log(`Script written scene by scene: "${sc.title}" — ${sc.scenes.length} scenes, ${sc.scenes.reduce((n, x) => n + x.narration.split(' ').length, 0)} words.`);
+          return sc;
+        }
+      }
+    } catch (e: any) { log(`Scene-by-scene writing failed (${e?.message || e}).`); }
+  }
   if (nearMiss) {
     log(`Using the best AI script (${nearMiss.words} words — a little shorter than asked) from ${nearMiss.script.model}.`);
     const sc = withSources(nearMiss.script);
@@ -1365,6 +1385,37 @@ async function generateScript(pastStory: string, pastTitles: string[], pastSourc
   }
   log(`⚠️ AI script generation failed (${lastError}).`);
   return { ...templateScript(), aiError: lastError };
+}
+
+/** Plan the scenes (a short JSON), then write each scene's narration on its own (plain text). */
+async function sceneByScene(system: string, prompt: string): Promise<any | null> {
+  const L = lengthSpec();
+  const [lo, hi] = String(L.scenes).split('-').map((x) => parseInt(x, 10));
+  const n = Math.max(L.minScenes, Math.round(((lo || L.minScenes) + (hi || L.maxScenes)) / 2));
+  const [wlo, whi] = String(L.words).split('-').map((x) => parseInt(x, 10));
+  const per = Math.max(12, Math.round(((wlo || L.minWords) + (whi || L.maxWords)) / 2 / n));
+  let plan: any = null;
+  const planUser = `${prompt}\n\nFIRST, ONLY PLAN THE VIDEO. Return ONE JSON object: {"title": "", "description": "2-3 sentences", "hashtags": ["5-8 without #"], "tags": ["5-10"], "visualStyle": "", "characters": "", "scenes": [{"beat": "what this scene says or shows, one line", "shot": "scene|panel|full", "emotion": "neutral", "imagePrompt": "", "searchQuery": ""}]} with EXACTLY ${n} scenes that build to a strong ending.`;
+  for await (const a of LLM.attempts({ system, user: planUser, temperature: 0.8, maxTokens: 3000, json: true, timeoutMs: 120000, task: 'script_plan' })) {
+    try { const j = extractJson(a.text); if (Array.isArray(j?.scenes) && j.scenes.length >= Math.ceil(n * 0.7) && j.title) { plan = j; break; } } catch {}
+  }
+  if (!plan) return null;
+  const beats = plan.scenes.slice(0, n + 2).map((x: any, i: number) => `${i + 1}. ${String(x?.beat || x?.narration || '').slice(0, 200)}`).join('\n');
+  const out: any[] = [];
+  for (let i = 0; i < Math.min(plan.scenes.length, n + 2); i++) {
+    const sc = plan.scenes[i] || {};
+    const before = out.slice(-2).map((x) => x.narration).join(' ');
+    const user = `You write the voice-over of a short video, ONE scene at a time.\nVIDEO TITLE: ${plan.title}\nTHE WHOLE PLAN:\n${beats}\n\n${before ? `WHAT WAS JUST SAID: "${before.slice(-500)}"\n` : ''}NOW WRITE SCENE ${i + 1} of ${plan.scenes.length}: ${String(sc.beat || '').slice(0, 300)}\nWrite ONLY the words spoken in this scene: ${Math.max(8, per - 4)}-${per + 8} words, natural spoken sentences that continue smoothly from what was just said.${i === plan.scenes.length - 1 ? ' This is the last scene: land the ending and invite viewers to follow.' : ''} You may put one performance tag like [happy], [serious], [surprised] or [point] right before a word. No headings, no scene numbers, no quotes.`;
+    let text = '';
+    for await (const a of LLM.attempts({ system: 'You are a natural, vivid scriptwriter for short videos. You answer with the spoken words only.', user, temperature: 0.8, maxTokens: 400, timeoutMs: 90000, task: 'script_scene' })) {
+      const t = String(a.text || '').replace(/^["“]|["”]$/g, '').replace(/^(scene\s*\d+[:.)-]\s*)/i, '').replace(/\s+/g, ' ').trim();
+      if (t.split(' ').length >= 6) { text = t; break; }
+    }
+    if (!text) continue;
+    out.push({ narration: text, shot: sc.shot, emotion: sc.emotion, imagePrompt: sc.imagePrompt || sc.beat, searchQuery: sc.searchQuery });
+  }
+  if (out.length < Math.ceil(n * 0.6)) return null;
+  return { ...plan, scenes: out };
 }
 
 /** Ask the local model to lengthen a script it wrote (same JSON shape, more scenes and narration). */
@@ -2651,6 +2702,8 @@ async function renderWithStage(opts: {
     chorusIntervals: opts.chorusIntervals || [],
     // The presenter: the CSS character spec designed in the app (the stage draws it).
     characterSpec: CFG.characterSpec,
+    // Stories can be pictures + voice-over only (no presenter on screen).
+    noCharacter: !!CFG.noCharacter,
     // A different outfit (same person) in every video of this automation.
     wardrobeSeed: `${CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}`,
     ...(opts.musical ? { musical: opts.musical, musicalStyle: opts.musical.style || '' } : {}),
@@ -4072,7 +4125,7 @@ async function transcribeVoice(audio: string, hint: string): Promise<Word[] | nu
   fs.writeFileSync(script, `import json,sys
 from faster_whisper import WhisperModel
 audio,hint,out=sys.argv[1],sys.argv[2],sys.argv[3]
-m=WhisperModel("small",device="cpu",compute_type="int8")
+m=WhisperModel("base",device="cpu",compute_type="int8",cpu_threads=4)
 segs,info=m.transcribe(audio,word_timestamps=True,beam_size=1,condition_on_previous_text=False,initial_prompt=(hint or None))
 words=[]
 for s in segs:
@@ -4128,6 +4181,14 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   if (k < words.length) parts[parts.length - 1] = `${parts[parts.length - 1]} ${words.slice(k).join(' ')}`.trim();
   const style = S.kind === 'story' ? 'storybook illustration, 3D animated film still, warm cinematic light, rich colours' : S.kind === 'kids' ? 'bright cheerful cartoon illustration for children, soft shapes, pastel colours' : 'clean modern illustration, soft light, vibrant colours';
   let prompts: { imagePrompt: string; searchQuery: string; emotion: string; title?: string }[] = parts.map((p) => ({ imagePrompt: `${style}, ${p.slice(0, 220)}`, searchQuery: p.split(/\s+/).filter((w) => w.length > 4).slice(0, 4).join(' '), emotion: 'neutral' }));
+  // The script's own [tags], re-based onto each scene's words.
+  const offsets: number[] = [];
+  { let o = 0; for (const p of parts) { offsets.push(o); o += p.split(/\s+/).filter(Boolean).length; } }
+  const userCues: Cue[] = (CFG as any).studioCues || [];
+  const sceneCues = (i: number): Cue[] => {
+    const a = offsets[i], b = i + 1 < offsets.length ? offsets[i + 1] : Infinity;
+    return userCues.filter((c) => c.index >= a && c.index < b).map((c) => ({ ...c, index: c.index - a }));
+  };
   let title = S.title;
   if (!CFG.offline) {
     const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word stock-photo search query, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).
@@ -4151,7 +4212,7 @@ Return ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": ""
   return {
     title: title || parts[0].split(/\s+/).slice(0, 7).join(' ').replace(/[.,!?]+$/, ''),
     description: '', hashtags: [], tags: [], visualStyle: style, characters: '', usedFallbackTemplate: false,
-    scenes: parts.map((p, i) => ({ narration: p, cues: [{ index: 0, tag: prompts[i].emotion }], shot: i === 0 ? 'scene' : (i % 3 === 2 ? 'panel' : 'scene'), emotion: prompts[i].emotion, imagePrompt: prompts[i].imagePrompt, searchQuery: prompts[i].searchQuery })),
+    scenes: parts.map((p, i) => ({ narration: p, cues: [{ index: 0, tag: prompts[i].emotion }, ...sceneCues(i)], shot: i === 0 ? 'scene' : (i % 3 === 2 ? 'panel' : 'scene'), emotion: prompts[i].emotion, imagePrompt: prompts[i].imagePrompt, searchQuery: prompts[i].searchQuery })),
   } as Script;
 }
 
@@ -4216,13 +4277,39 @@ async function produceStudio(t0: number): Promise<number> {
     return 0;
   }
 
+  // ---- Stickman fight: the user's match-up, choreographed by the fight engine ----
+  if (S.kind === 'stickman') {
+    CFG.category = 'animation';
+    (CFG as any).animStyle = 'stickman';
+    CFG.topic = S.script.slice(0, 300);
+    CFG.allowFallbackPublish = true;      // never fail: a built-in match-up if the writer is unavailable
+    await reportStatus('running', 'Planning the fight', 20, `Match-up: ${CFG.topic}`);
+    const out = await runAnimated(animKit() as any);
+    const outDur = await probeDuration(OUTPUT_VIDEO);
+    if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+    if (S.watermark) await studioWatermark();
+    await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
+    await studioDeliver(S, { title: out.title || S.title || 'Stickman fight', durationSec: Math.round(outDur) });
+    await reportStatus('completed', 'Your animation is ready', 100, `Done in ${Math.round((Date.now() - t0) / 1000)}s.`);
+    return 0;
+  }
+
   // ---- A talking character (with pictures behind): talk, story, kids, news, cooking, tech, ads ----
+  // A story is pictures + voice-over unless the user added a storyteller.
+  CFG.noCharacter = S.kind === 'story' && !S.showCharacter;
   CFG.category = ({ story: 'stories', kids: 'stories', talk: 'tech', motivation: 'tech', news: 'news', cooking: 'cooking', tech: 'tech', ads: 'ads' } as Record<string, string>)[S.kind] || 'tech';
   if (CFG.category === 'stories' && !CFG.offline) void startImageGenerator();
   let narration: Narration, text: string;
-  if (S.voiceUrl) ({ narration, text } = await studioVoice(S));
-  else {
-    text = cleanForSpeech(S.script).split(/\s+/).slice(0, Math.round(S.maxSeconds * 2.6)).join(' ');
+  // [tags] in the user's script (turns, gestures, emotions) are direction, never spoken.
+  const tagged = parseTaggedNarration(S.script || '');
+  (CFG as any).studioCues = tagged.cues;
+  if (S.voiceUrl) {
+    ({ narration, text } = await studioVoice({ ...S, script: tagged.text }));
+    // Own voice: place each cue at the same relative point of what was actually said.
+    const said = text.split(/\s+/).filter(Boolean).length, written = Math.max(1, tagged.text.split(/\s+/).filter(Boolean).length);
+    (CFG as any).studioCues = tagged.cues.map((c) => ({ ...c, index: Math.round((c.index / written) * said) }));
+  } else {
+    text = cleanForSpeech(tagged.text).split(/\s+/).slice(0, Math.round(S.maxSeconds * 2.6)).join(' ');
     if (text.split(/\s+/).length < 3) throw new PipelineError('script_empty', 'Write a few words for your character to say.');
     await reportStatus('running', 'Recording the voice', 18, `${text.split(/\s+/).length} words.`);
     CFG.gender = S.voiceGender;
@@ -4231,6 +4318,7 @@ async function produceStudio(t0: number): Promise<number> {
   }
   await reportStatus('running', 'Planning the scenes', 32, `Voice ready (${narration.duration.toFixed(0)}s).`);
   const script = await studioScenes(S, text);
+  if (CFG.noCharacter) for (const sc of script.scenes) sc.shot = 'full';
   const duration = +(narration.duration + 1.0).toFixed(3);
   const times = timeScenes(script.scenes, narration.words, duration);
   const cues = timeCues(script.scenes, narration.words, times);
@@ -4345,6 +4433,7 @@ async function main() {
   // 1. Script
   const script = await generateScript(pastStory, pastTitles, pastSources);
   polishMetadata(script);
+  if (CFG.noCharacter) for (const sc of script.scenes) sc.shot = 'full';   // pictures fill the frame; no presenter
   log(`Metadata: ${script.description.split(/\s+/).length}-word description, hashtags: ${script.hashtags.map((h) => `#${h}`).join(' ')}`);
   if (script.usedFallbackTemplate && !CFG.allowFallbackPublish) {
     // Keys work but every free model was busy / rate-limited / filtered: retry later (no pause).

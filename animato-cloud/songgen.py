@@ -557,12 +557,32 @@ def cmd_serve(_args):
     ckpt = os.path.join(repo, "checkpoints")
     key = "animato-" + os.urandom(8).hex()
 
-    proc, base, _ = start_server(repo, ckpt, key, 8011, False)
+    # Tell the app the studio is alive while the engine installs / loads (can take many minutes the
+    # first time), so the app never starts a second studio for the same account.
+    loading = {"on": not warm_only}
+
+    def loading_beat():
+        while loading["on"]:
+            try:
+                app_call(app, "POST", "/api/music/runner/hello", {"token": token, "state": "loading"}, timeout=20)
+            except Exception:
+                pass
+            for _ in range(50):
+                if not loading["on"]:
+                    break
+                time.sleep(0.5)
+
+    if loading["on"] and app and token:
+        threading.Thread(target=loading_beat, daemon=True).start()
+    try:
+        proc, base, _ = start_server(repo, ckpt, key, 8011, False)
+    finally:
+        loading["on"] = False
     if warm_only:
         log("done", "music engine installed and loaded once — cached for the next songs")
         proc.kill()
         return
-    app_call(app, "POST", "/api/music/runner/hello", {"token": token, "info": {"cpus": os.cpu_count()}})
+    app_call(app, "POST", "/api/music/runner/hello", {"token": token, "state": "ready", "info": {"cpus": os.cpu_count()}})
     log("ready", f"studio open (stops after {idle_min:.0f} idle minutes)")
     last_work = time.time()
     while time.time() - last_work < idle_min * 60:
