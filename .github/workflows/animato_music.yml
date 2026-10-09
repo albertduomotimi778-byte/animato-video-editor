@@ -79,6 +79,14 @@ jobs:
           fi
           free -h; nproc; df -h /
 
+      - name: Install ffmpeg (the music engine saves and masters songs with it)
+        run: |
+          if ! command -v ffmpeg > /dev/null; then
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null 2>&1 \
+              || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null; }
+          fi
+          ffmpeg -hide_banner -version | head -n 1
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

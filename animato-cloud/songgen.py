@@ -387,7 +387,15 @@ def compose(base, key, body, deadline):
         first = res[0] if isinstance(res, list) and res else (res or {})
         ref = str(first.get("file") or first.get("audio_url") or first.get("url") or "")
         if not ref:
-            raise RuntimeError("the music engine finished but returned no audio")
+            # The engine composed the song but could not save it; say why (from its own log).
+            why = ""
+            try:
+                logp = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(os.environ.get("ACESTEP_REPO") or "~/acestep-local/repo"))), "api_server.log")
+                lines = [x for x in open(logp, encoding="utf-8", errors="replace").read().splitlines() if re.search(r"Failed to save|export failed|ffmpeg|Error", x)]
+                why = lines[-1].strip()[-220:] if lines else ""
+            except Exception:
+                pass
+            raise RuntimeError("the music engine composed the song but could not save it" + (f" ({why})" if why else ""))
         if ref.startswith("data:audio"):
             import base64
             return base64.b64decode(ref.split(",", 1)[1]), time.time() - t0
@@ -455,7 +463,7 @@ def cmd_generate(args):
     key = "animato-" + os.urandom(8).hex()
     body = {
         "prompt": caption, "caption": caption, "lyrics": lyrics or "[Instrumental]", "audio_duration": duration,
-        "audio_format": "mp3", "batch_size": 1, "vocal_language": lang_code if not instrumental else "unknown",
+        "audio_format": "wav", "batch_size": 1, "vocal_language": lang_code if not instrumental else "unknown",
         "time_signature": "4", "use_cot_caption": False, "ai_token": key, "seed": seed, "use_random_seed": False,
     }
     if bpm:
@@ -521,7 +529,7 @@ def song_request(req):
     duration = max(MIN_DURATION, min(MAX_DURATION, max(duration, needed) or 60))
     body = {
         "prompt": caption, "caption": caption, "lyrics": lyrics or "[Instrumental]", "audio_duration": duration,
-        "audio_format": "mp3", "batch_size": 1, "vocal_language": lang_code if not instrumental else "unknown",
+        "audio_format": "wav", "batch_size": 1, "vocal_language": lang_code if not instrumental else "unknown",
         "time_signature": "4", "use_cot_caption": False, "thinking": False, "seed": seed, "use_random_seed": False,
     }
     if bpm:
