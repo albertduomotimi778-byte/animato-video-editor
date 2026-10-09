@@ -266,6 +266,43 @@ class PipelineError extends Error {
 
 function log(msg: string) {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${msg}`);
+  liveDetail(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Live detail: what the runner is doing right now, shown under the step in the app
+// ("Rendering 42% (210/502 frames)", "Voice-over recorded", "Finding pictures 3/8").
+// Every log line is a candidate; at most one update every 4 s reaches the app (one
+// small database write), the newest line wins, and nothing is sent after the run ends.
+// ---------------------------------------------------------------------------
+let liveStepName = '';
+let liveEnded = false;
+let liveSentAt = 0;
+let livePending = '';
+let liveTimer: ReturnType<typeof setTimeout> | null = null;
+function friendlyDetail(msg: string): string {
+  let t = String(msg || '').replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim();
+  if (!t || /^(::|\[debug\]|App request|DEBUG)/i.test(t) || /token|secret|api[_ -]?key|password/i.test(t)) return '';
+  return t.length > 140 ? `${t.slice(0, 137)}…` : t;
+}
+function liveDetail(msg: string) {
+  try { if (liveEnded || !CFG.appUrl) return; } catch { return; } // not configured yet (module start-up)
+  const line = friendlyDetail(msg);
+  if (!line) return;
+  livePending = line;
+  const wait = 4000 - (Date.now() - liveSentAt);
+  if (wait <= 0) { flushLive(); return; }
+  if (!liveTimer) { liveTimer = setTimeout(flushLive, wait); (liveTimer as any).unref?.(); }
+}
+function flushLive() {
+  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  if (liveEnded || !livePending) return;
+  const detail = livePending; livePending = ''; liveSentAt = Date.now();
+  const route = STUDIO ? `/api/animate/runner/${STUDIO.id}/status` : (CFG.campaignId ? `${campaignPath()}/status` : '');
+  if (!route || !CFG.appUrl) return;
+  // One attempt, short timeout: a missed detail is replaced by the next one.
+  void fetch(`${CFG.appUrl}${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Animato-Runner-Key': CFG.runnerKey || '' },
+    body: JSON.stringify({ status: 'running', step: liveStepName || undefined, detail, partNumber: CFG.partNumber }), signal: AbortSignal.timeout(8000) }).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +532,14 @@ async function publishThreadsVideo(meta: { title: string; description: string; v
   return c.username ? `https://www.threads.net/@${encodeURIComponent(c.username)}/post/${pd.id}` : `https://www.threads.net/`;
 }
 
-async function reportStatus(status: 'running' | 'failed' | 'completed' | 'skipped', step: string, progress: number, logLine: string, extra: Record<string, any> = {}) {
+let lastProgress = 0;
+let lastLiveAt = 0;
+async function reportStatus(status: 'running' | 'failed' | 'completed' | 'skipped', step: string, progress: number | undefined, logLine: string, extra: Record<string, any> = {}) {
+  if (progress === undefined) progress = lastProgress; else lastProgress = Math.max(lastProgress, progress);
+  lastLiveAt = Date.now();
+  if (status !== 'running') liveEnded = true;
+  if (step) liveStepName = step;
+  liveSentAt = Date.now();
   const res = await appRequest('POST', STUDIO ? `/api/animate/runner/${STUDIO.id}/status` : `${campaignPath()}/status`, {
     status, step, progress, log: logLine, partNumber: CFG.partNumber, runId: CFG.runId, runUrl: CFG.runUrl, ...extra
   });
@@ -947,7 +991,7 @@ Return ONLY this JSON (no markdown):
   "officialUrl": "tech/tutorials: the official website of the product (real URL only), else empty",
   "premise": "stories only: 2-3 sentences — who this story is about, where, and everything that has happened so far",
   "scenes": [
-    { "narration": "[emotion] spoken words with [gesture] tags where they land", "shot": "scene|panel|full", "emotion": "main emotion of the scene", "imagePrompt": "stories only: the animated scene to draw", "searchQuery": "real things to find a real photo of (names of people, products, places, dishes)", "productShot": false }
+    { "narration": "[emotion] spoken words with [gesture] tags where they land", "shot": "scene|panel|full", "emotion": "main emotion of the scene", "imagePrompt": "stories only: what the scene shows", "searchQuery": "stories: 2-4 words to find a matching CARTOON ILLUSTRATION (main subject + setting, e.g. \"fox forest night\"); everything else: real things to find a real photo of (names of people, products, places, dishes)", "productShot": false }
   ]
 }`;
 }
@@ -1926,6 +1970,34 @@ async function libraryImages(query: string, forAds = false): Promise<WebImage[]>
 }
 
 /**
+ * Story pictures: cartoon / storybook ILLUSTRATIONS found on the web (never generated).
+ * Openverse illustrations + digitized artwork (CC0 / PDM / CC BY), Pixabay illustrations and
+ * vectors (when a key is set) and Wikimedia Commons drawings, all freely licensed and credited.
+ */
+async function cartoonImages(query: string): Promise<WebImage[]> {
+  if (!query) return [];
+  const q = encodeURIComponent(query);
+  const out: WebImage[] = [];
+  const jobs: Promise<void>[] = [];
+  jobs.push((async () => {
+    const o = await fetchJson(`${CFG.openverseBase}?q=${q}&page_size=20&mature=false&license=cc0,pdm,by&category=illustration,digitized_artwork`);
+    for (const r of o?.results || []) {
+      if ((r.width || 0) < 600) continue;
+      const lic = reusableLicense(`${r.license === 'by' ? 'CC BY' : String(r.license || '').toUpperCase()} ${r.license_version || ''}`.trim());
+      if (!lic) continue;
+      out.push({ url: r.url, meta: `${plain(r.title)} ${(Array.isArray(r.tags) ? r.tags : []).map((t: any) => t?.name || '').join(' ')} illustration cartoon`, credit: shortCredit(r.creator || '', lic), kind: 'library', attribution: `"${plain(r.title) || 'Untitled'}" by ${plain(r.creator) || 'unknown author'} — ${lic}${r.license_url ? ` (${r.license_url})` : ''} — ${r.foreign_landing_url || r.url}` });
+    }
+  })());
+  if (CFG.pixabayKey) for (const type of ['illustration', 'vector']) jobs.push((async () => {
+    const d = await fetchJson(`https://pixabay.com/api/?key=${CFG.pixabayKey}&q=${q}&image_type=${type}&safesearch=true&per_page=10&orientation=${orientation === 'landscape' ? 'horizontal' : 'vertical'}`);
+    for (const h of d?.hits || []) out.push({ url: h.largeImageURL, meta: `${String(h.tags || '')} illustration cartoon`, credit: `Illustration: ${String(h.user || 'Pixabay').slice(0, 24)} · Pixabay`, kind: 'library', attribution: `Image by ${h.user || 'unknown'} on Pixabay (Pixabay Content License) — ${h.pageURL || 'https://pixabay.com'}` });
+  })());
+  jobs.push((async () => { out.push(...await commonsFiles(`generator=search&gsrnamespace=6&gsrlimit=12&gsrsearch=${encodeURIComponent(`${query} cartoon OR illustration OR drawing`)}%20filetype:bitmap`)); })());
+  await Promise.all(jobs.map((j) => j.catch(() => {})));
+  return out.filter((x) => x.url && !BAD_IMAGE.test(x.url));
+}
+
+/**
  * Error / block pages that must NEVER end up in a video ("This site can't be
  * reached", HTTP errors, bot checks, captchas, parked domains).
  */
@@ -2325,36 +2397,47 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
   }
 
   if (isStory) {
-    // ---- STORIES: fiction, so every picture is drawn — original 3D animated cartoon scenes only.
-    const seedBase = parseInt(crypto.createHash('md5').update(`${CFG.campaignId}:${CFG.partNumber}`).digest('hex').slice(0, 6), 16);
-    const ready = await startImageGenerator(); // already loading since the run started
-    const deadline = Date.now() + 9 * 60 * 1000;
-    const drawOne = async (i: number) => {
-      if (!ready || imagegenDisabled || Date.now() > deadline) return;
+    // ---- STORIES: cartoon / storybook illustrations FOUND on the web that fit each scene.
+    // Nothing is generated on the CPU (that took minutes per picture).
+    const deadline = Date.now() + 4 * 60 * 1000;
+    const topic = (script.title || '').replace(/\s*\(part \d+\)\s*$/i, '').split(/\s+/).slice(0, 5).join(' ');
+    const attributions: string[] = [];
+    const STOP = new Set(['the', 'and', 'with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'was', 'were', 'his', 'her', 'she', 'him', 'for', 'but', 'not', 'all', 'one', 'had', 'has', 'have', 'who', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time']);
+    const words = (t: string, n: number) => t.replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w.toLowerCase())).slice(0, n).join(' ');
+    const fitOne = async (i: number) => {
       const s = script.scenes[i];
       const raw = path.join(WORK_DIR, `scene_${i}.raw`), out = path.join(WORK_DIR, `scene_${i}.jpg`);
-      // Scene first, then the fixed look of the characters in it. The generator cleans the prompt
-      // (calm medium shots, no crowds / fingers), adds the story style and trims the tail to fit.
-      const prompt = [animatedPrompt(s.imagePrompt || s.narration).slice(0, 320), animatedPrompt(castFor(script, s)).slice(0, 160)].filter(Boolean).join('. ');
-      const tries: string[] = [];
-      let chosen = '';
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0 && (imagegenDisabled || Date.now() > deadline - 20000)) break;
-        const got = await aiImage(prompt, seedBase + i * 7 + attempt * 977, raw, '', 'story');
-        if (!got) break;
-        const cand = path.join(WORK_DIR, `scene_${i}_try${attempt}.jpg`);
-        if (!(await toJpeg(raw, cand, 0))) continue;
-        tries.push(cand);
-        const ok = await anatomyOk(cand); // false = melted face / extra limbs → draw it again
-        if (ok !== false) { chosen = cand; break; }
-        anatomyRedraws++;
+      const q = (s.searchQuery || words(s.imagePrompt || s.narration, 4)).replace(/\b(photo|photograph|stock)\b/gi, '').trim();
+      // Most specific first: the scene as a cartoon, a simpler version, then the story's topic.
+      const queries = Array.from(new Set([q, words(q, 2), words(s.narration, 3), topic].filter(Boolean)));
+      for (const query of queries) {
+        if (Date.now() > deadline) break;
+        const list = await cartoonImages(query);
+        for (const img of list.slice(0, 8)) {
+          if (usedImageUrls.has(img.url)) continue;
+          if (!metadataMatches(words(query, 3), img.meta || '', false)) continue;
+          if (await takeImage(img, raw, out)) {
+            files[i] = out; credits[i] = img.credit;
+            if (img.attribution && !attributions.includes(img.attribution)) attributions.push(img.attribution);
+            return;
+          }
+        }
       }
-      if (!chosen && tries.length) chosen = tries[0]; // every try was flagged: keep the first one
-      if (chosen) { fs.copyFileSync(chosen, out); files[i] = out; aiCount++; }
+      // Still nothing: a licensed photo of the scene (better than a repeated picture).
+      for (const query of [q, topic].filter(Boolean)) {
+        if (Date.now() > deadline) break;
+        for (const img of (await libraryImages(query)).slice(0, 6)) {
+          if (usedImageUrls.has(img.url) || !metadataMatches(words(query, 3), img.meta || '', false)) continue;
+          if (await takeImage(img, raw, out)) { files[i] = out; credits[i] = img.credit; if (img.attribution && !attributions.includes(img.attribution)) attributions.push(img.attribution); return; }
+        }
+      }
     };
-    // One picture is drawn at a time (the CPU is the limit); the 2nd worker only overlaps file conversion.
+    let done = 0;
     const queue = script.scenes.map((_, i) => i);
-    await Promise.all(Array.from({ length: 2 }, async () => { while (queue.length) await drawOne(queue.shift()!); }));
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (queue.length) { await fitOne(queue.shift()!); done++; log(`Found pictures for ${done}/${n} scenes`); }
+    }));
+    script.imageAttributions = attributions;
   } else {
     // ---- EVERYTHING ELSE: real images found on the web. Nothing is generated.
     const deadline = Date.now() + 5 * 60 * 1000;
@@ -2500,21 +2583,18 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
         // Cooking: a picture of something else never beats a picture of THIS ingredient/step.
         if (cat === 'cooking' && k >= 1) break;
       }
-      // Cooking: no real photo of this ingredient / step → a realistic food photo of exactly it.
-      if (cat === 'cooking' && Date.now() < deadline + 90_000) {
-        if (await foodImage(s, q, 9000 + i * 13, raw, out)) { set(out, 'AI-generated image'); generatedFood++; return; }
-      }
       // Tech: the product's own verified website shows the exact product — better than a wrong one.
       const sh = nextShot() || (cat === 'tech' ? shots.sort((a, b) => a.uses - b.uses)[0] || null : null);
       if (sh) { sh.uses++; shotUses++; s.shot = 'panel'; set(sh.file, sh.credit); }
     };
     const queue = script.scenes.map((_, i) => i);
-    await Promise.all(Array.from({ length: 4 }, async () => { while (queue.length) await fetchOne(queue.shift()!); }));
+    let fetched = 0;
+    await Promise.all(Array.from({ length: 4 }, async () => { while (queue.length) { await fetchOne(queue.shift()!); fetched++; log(`Found pictures for ${fetched}/${n} scenes`); } }));
     // Second chance for scenes still without a picture: the whole topic, looser matching (no vision veto),
     // then an AI-made editorial illustration (credited as such). A blank or placeholder picture is never shown.
     const missing = script.scenes.map((_, i) => i).filter((i) => !files[i]);
     if (missing.length && !forAds) {
-      log(`Images: ${missing.length}/${n} scene(s) had no matching photo — trying the whole topic, then an illustration.`);
+      log(`Images: ${missing.length}/${n} scene(s) had no matching photo — trying the whole topic.`);
       const topic = subject.split(/\s+/).slice(0, 6).join(' ');
       let looseList: WebImage[] | null = null;
       let aiMade = 0;
@@ -2530,14 +2610,8 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
           if (await takeImage(img, raw, out)) { got = img; break; }
         }
         if (got) { files[i] = out; credits[i] = got.credit; if (got.attribution && !attributions.includes(got.attribution)) attributions.push(got.attribution); continue; }
-        if (aiMade < 4 && cat !== 'cooking') {
-          const what = (s.imagePrompt || s.narration || topic).slice(0, 260);
-          const prompt = slimPrompt(`${what}. ${topic}`, 230);
-          const ai = await aiImage(prompt, 4000 + i * 17, raw, EDITORIAL_STYLE);
-          if (ai && await toJpeg(raw, out, ai === 'ai' ? 0.04 : 0)) { files[i] = out; credits[i] = 'AI-generated illustration'; aiMade++; aiCount++; }
-        }
       }
-      log(`Images: second chance filled ${missing.filter((i) => files[i]).length}/${missing.length} (${aiMade} illustration(s)).`);
+      log(`Images: second chance filled ${missing.filter((i) => files[i]).length}/${missing.length}.`);
     }
     // Leftover product photos still beat a repeated image for ads.
     for (let i = 0; i < n && productFiles.length; i++) if (!files[i]) { files[i] = productFiles[productCursor++ % productFiles.length]; credits[i] = 'Product image'; }
@@ -2561,7 +2635,7 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
     files.fill(grad);
   }
   script.imageCredits = Array.from(new Set(credits.filter((c): c is string => !!c && c !== 'Product image')));
-  if (isStory) log(`Images: ${files.filter(Boolean).length}/${n} scenes, ${aiCount} drawn as original 3D animated scenes by the local image generator${anatomyRedraws ? ` (${anatomyRedraws} redrawn after the anatomy check)` : ''}${imagegenDisabled ? `; generator unavailable: ${imagegenDisabled}` : ''}.`);
+  if (isStory) log(`Images: ${new Set(files.filter(Boolean)).size} cartoon illustration(s) found for ${n} scenes — none generated. Sources: ${script.imageCredits.join(', ') || 'none found'}.`);
   else log(`Images: ${new Set(files.filter(Boolean)).size} real image(s) for ${n} scenes — none generated. Sources: ${script.imageCredits.join(', ') || 'none found'}.`);
   return { files, aiCount, credits };
 }
@@ -4191,7 +4265,7 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   };
   let title = S.title;
   if (!CFG.offline) {
-    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word stock-photo search query, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).
+    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).
 SCENES:
 ${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}
 Return ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
@@ -4298,7 +4372,6 @@ async function produceStudio(t0: number): Promise<number> {
   // A story is pictures + voice-over unless the user added a storyteller.
   CFG.noCharacter = S.kind === 'story' && !S.showCharacter;
   CFG.category = ({ story: 'stories', kids: 'stories', talk: 'tech', motivation: 'tech', news: 'news', cooking: 'cooking', tech: 'tech', ads: 'ads' } as Record<string, string>)[S.kind] || 'tech';
-  if (CFG.category === 'stories' && !CFG.offline) void startImageGenerator();
   let narration: Narration, text: string;
   // [tags] in the user's script (turns, gestures, emotions) are direction, never spoken.
   const tagged = parseTaggedNarration(S.script || '');
@@ -4322,7 +4395,7 @@ async function produceStudio(t0: number): Promise<number> {
   const duration = +(narration.duration + 1.0).toFixed(3);
   const times = timeScenes(script.scenes, narration.words, duration);
   const cues = timeCues(script.scenes, narration.words, times);
-  await reportStatus('running', 'Drawing the scenes', 45, `${script.scenes.length} scenes.`);
+  await reportStatus('running', 'Finding pictures for the scenes', 45, `${script.scenes.length} scenes.`);
   const [{ files: images, credits }, music] = await Promise.all([gatherImages(script), findMusic(duration, narration)]);
   await reportStatus('running', 'Animating your character', 62, 'Animating.');
   const badge = S.kind === 'kids' ? 'KIDS' : S.kind === 'story' ? 'STORY' : S.kind === 'talk' || S.kind === 'motivation' ? '' : S.kind.toUpperCase();
@@ -4378,7 +4451,6 @@ async function main() {
   console.log('='.repeat(64));
 
   // Stories are drawn by the local image generator: start loading its model now, while the script is written.
-  if (CFG.category === 'stories' && !CFG.offline) void startImageGenerator();
 
   let pastStory = CFG.previousScript ? `PART ${CFG.partNumber - 1}:\n${CFG.previousScript}` : '';
   let pastTitles: string[] = [];
