@@ -215,7 +215,9 @@ const CFG = {
 interface StudioJob {
   id: string; kind: string; title: string; script: string; voiceUrl: string; voiceGender: 'female' | 'male';
   cast: { name: string; gender: 'female' | 'male'; spec: any }[]; watermark: boolean; maxSeconds: number;
-  location: string; time: 'day' | 'night'; showCharacter: boolean; fast: boolean; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
+  location: string; time: 'day' | 'night'; showCharacter: boolean; fast: boolean; musicMode?: 'auto' | 'upload' | 'none'; musicUrl?: string; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
+  musicLanguage?: string; subGenre?: string; stageMode?: 'auto' | 'fixed'; stageId?: number;
+  podcastStudio?: any; podcastHosts?: any[]; adWebsiteUrl?: string; adBrief?: string; adImages?: string[]; adProfile?: any;
 }
 const STUDIO: StudioJob | null = (() => {
   const s = parseSpec(JOB.studio_job);
@@ -227,7 +229,12 @@ const STUDIO: StudioJob | null = (() => {
     cast: (Array.isArray(s.cast) ? s.cast : []).slice(0, 3).map((c: any, i: number) => ({ name: String(c?.name || `Character ${i + 1}`).slice(0, 24), gender: gender(c?.gender), spec: c?.spec || null })),
     watermark: s.watermark !== false, maxSeconds: Math.max(15, Math.min(300, Number(s.maxSeconds) || 60)),
     location: String(s.location || 'living_room'), time: s.time === 'night' ? 'night' : 'day', showCharacter: s.showCharacter !== false, fast: s.fast === true,
+    musicMode: s.musicMode === 'none' ? 'none' : s.musicMode === 'upload' ? 'upload' : 'auto', musicUrl: String(s.musicUrl || ''),
     scenes: Array.isArray(s.scenes) ? s.scenes.slice(0, 8) : [],
+    musicLanguage: String(s.musicLanguage || 'English').slice(0, 40), subGenre: String(s.subGenre || 'afrobeats').slice(0, 80),
+    stageMode: s.stageMode === 'fixed' ? 'fixed' : 'auto', stageId: Math.max(0, Math.min(1_000_000, Number(s.stageId) || 0)),
+    podcastStudio: s.podcastStudio || null, podcastHosts: Array.isArray(s.podcastHosts) ? s.podcastHosts.slice(0, 3) : [],
+    adWebsiteUrl: String(s.adWebsiteUrl || '').slice(0, 600), adBrief: String(s.adBrief || '').slice(0, 14000), adImages: Array.isArray(s.adImages) ? s.adImages.slice(0, 12).map(String) : [], adProfile: s.adProfile && typeof s.adProfile === 'object' ? s.adProfile : null,
   };
 })();
 
@@ -2466,7 +2473,8 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
     const pool: WebImage[] = [];
     const briefUrl = forAds && !CFG.adProfile.service ? cleanOfficialUrl((CFG.adBrief.match(/\bhttps?:\/\/[^\s)"'<>]+|\bwww\.[a-z0-9-]+\.[a-z.]{2,}[^\s)"'<>]*/i) || [])[0]) : '';
     // A service has no website to show: never screenshot one for it.
-    const official = forAds && CFG.adProfile.service ? '' : (script.officialUrl || briefUrl);
+    const requestedSite = forAds && STUDIO?.adWebsiteUrl ? cleanOfficialUrl(STUDIO.adWebsiteUrl) : '';
+    const official = forAds && CFG.adProfile.service ? '' : (requestedSite || script.officialUrl || briefUrl);
     /** News / tech: the page the story itself was published on. */
     const storyLink = cleanOfficialUrl(script.sourceStory?.link || '');
     // ---- REAL SCREENSHOTS (everything except stories)
@@ -2714,9 +2722,11 @@ const MUSIC_PAUSE_LIFT_DB = 6;
 async function findMusic(seconds: number, narration: Narration): Promise<string | null> {
   try {
     const mood = moodFor(CFG.category, CFG.subGenre);
-    const file = path.join(WORK_DIR, `music_${mood}.wav`);
+    const uniqueMusicId = STUDIO?.id || CFG.runId || `${CFG.campaignId}:${CFG.partNumber}:${Date.now()}`;
+    const file = path.join(WORK_DIR, `music_${mood}_${String(uniqueMusicId).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)}.wav`);
     const t0 = Date.now();
-    const { L, R, sampleRate } = composeBuffers(mood, Math.max(10, seconds), `${CFG.campaignId}:${CFG.partNumber}`);
+    // The soundtrack is procedurally composed per video, with a unique seed; it isn't one cached generic loop.
+    const { L, R, sampleRate } = composeBuffers(mood, Math.max(10, seconds), `${uniqueMusicId}:${CFG.partNumber}:${Math.random().toString(36).slice(2)}`);
     eqForVoice(L, R, sampleRate);
     const voice = await analyseVoice(narration.audioPath);
     const speech = voice?.speech?.length ? voice.speech : narration.words.map((w) => ({ start: w.start, end: w.end }));
@@ -4215,14 +4225,23 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   const title = song.title;
   const badge = (CFG.subGenre || 'MUSICAL').toUpperCase().slice(0, 24);
   const endCard = 'Follow for the next original song';
-  const stage = await renderWithStage({ narration, scenes: timing.sections.map((s) => ({ narration: s.tag === 'chorus' ? 'CHORUS' : s.tag, shot: 'scene', emotion: s.emotion, imageQuery: '', imageCredit: '' })) as unknown as Scene[], times: timing.sections.map((s) => ({ start: s.start, end: s.end })), cues, images: timing.sections.map(() => null), title, badge, endCard, music: null, duration: generated.duration, musicalStage: true, chorusIntervals, lyrics: { lines: lyricLines.map((text, i) => ({ text, en: lyricEn[i] || '' })), noSpaces: NO_SPACE_LANGS.has(musicLanguage().code) }, musical: { stageId: CFG.stageId || 0, stageAutoSeed: `${CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}`, style: CFG.subGenre || '', sections: timing.sections, vocalSpans, drumLevel, keysLevel }, stems: stems || undefined });
+  const stage = await renderWithStage({ narration, scenes: timing.sections.map((s) => ({ narration: s.tag === 'chorus' ? 'CHORUS' : s.tag, shot: 'scene', emotion: s.emotion, imageQuery: '', imageCredit: '' })) as unknown as Scene[], times: timing.sections.map((s) => ({ start: s.start, end: s.end })), cues, images: timing.sections.map(() => null), title, badge, endCard, music: null, duration: generated.duration, musicalStage: true, chorusIntervals, lyrics: { lines: lyricLines.map((text, i) => ({ text, en: lyricEn[i] || '' })), noSpaces: NO_SPACE_LANGS.has(musicLanguage().code) }, musical: { stageId: CFG.stageId || 0, stageAutoSeed: `${STUDIO?.id || CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}:${Date.now()}`, style: CFG.subGenre || '', sections: timing.sections, vocalSpans, drumLevel, keysLevel }, stems: stems || undefined });
   if (!stage.ok) throw new PipelineError('musical_render_failed', `Musical stage render failed: ${stage.reason || 'unknown error'}`);
   const outDur = await probeDuration(OUTPUT_VIDEO);
   if (outDur < 5) throw new PipelineError('musical_render_failed', `Rendered musical video is only ${outDur.toFixed(1)}s long.`);
   const tags = Array.from(new Set([...(song.tags || []), ...(song.hashtags || []), engineName, 'music video']));
   const hashtagLine = youtubeHashtagLine([...(song.hashtags || musicHashtags(CFG.subGenre)), ...(IS_SHORTS ? ['shorts'] : [])]);
   const description = sanitizeYouTubeDescription([song.description, `🎤 Lead singer: ${CFG.gender}.`, `🎵 Style: ${CFG.subGenre || 'Musical'}.`, '🎬 Original cinematic music video with live-style stage performance, microphone, choir chorus, lip-sync and timed captions.', hashtagLine].join('\n\n'));
-  fs.writeFileSync(OUTPUT_META, JSON.stringify({ campaignId: CFG.campaignId, partNumber: CFG.partNumber, format: CFG.format, aspect: CFG.aspect, title, description, hashtags: song.hashtags, tags, model: engineName, lyrics: song.lyrics, sections: timing.sections, cues, voice: engineName, character: stage.character, durationSec: outDur, createdAt: new Date().toISOString() }, null, 2));
+  fs.writeFileSync(OUTPUT_META, JSON.stringify({ campaignId: CFG.campaignId, partNumber: CFG.partNumber, format: CFG.format, aspect: CFG.aspect, title, description, hashtags: song.hashtags, tags, model: engineName, lyrics: song.lyrics, sections: timing.sections, cues, voice: engineName, character: stage.character, durationSec: outDur, musicVariantId: STUDIO?.id || `${CFG.campaignId}:${CFG.partNumber}:${Date.now()}`, createdAt: new Date().toISOString() }, null, 2));
+  // A Tools music video is a one-off MP4. Return it directly to the user's creative list;
+  // do not save it as an automation episode or publish it to a connected social account.
+  if (STUDIO?.kind === 'musical') {
+    if (STUDIO.watermark) await studioWatermark();
+    await reportStatus('running', 'Saving your music video MP4', 92, `Rendered ${Math.round(outDur)}s.`);
+    await studioDeliver(STUDIO, { title: song.title || STUDIO.title || 'My Music Video', durationSec: Math.round(await probeDuration(OUTPUT_VIDEO)) });
+    await reportStatus('completed', 'Your music video is ready', 100, `Done in ${Math.round((Date.now() - t0) / 1000)}s.`);
+    return 0;
+  }
   const libId = await saveToLibrary({ title, topic: CFG.topic || CFG.subGenre, kind: 'musical', durationSec: Math.round(outDur), width: W, height: H });
   const picked = await pickBestFrame(OUTPUT_VIDEO, outDur, chorusIntervals.map((c) => ({ t: c.start + 1, w: 0.9 })));
   await saveLibraryThumbnail(libId, picked?.file || null);
@@ -4342,7 +4361,18 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   let k = 0;
   for (const g of groups) { const n = g.split(/\s+/).filter(Boolean).length; parts.push(words.slice(k, k + n).join(' ')); k += n; }
   if (k < words.length) parts[parts.length - 1] = `${parts[parts.length - 1]} ${words.slice(k).join(' ')}`.trim();
-  const style = S.kind === 'story' ? 'storybook illustration, 3D animated film still, warm cinematic light, rich colours' : S.kind === 'kids' ? 'bright cheerful cartoon illustration for children, soft shapes, pastel colours' : 'clean modern illustration, soft light, vibrant colours';
+  const style = S.kind === 'story'
+    ? 'storybook illustration, 3D animated film still, warm cinematic light, rich colours'
+    : S.kind === 'kids'
+      ? 'bright cheerful cartoon illustration for children, soft shapes, pastel colours'
+      : S.kind === 'ads'
+        ? 'premium product advertising, polished commercial cinematography, clear product focus, brand-consistent colours, uncluttered composition, realistic lighting, legible-safe negative space, no invented logos or text'
+        : 'clean modern illustration, soft light, vibrant colours';
+  // Use facts extracted from a supplied PDF and a public business website as storyboard context.
+  // The user's supplied script remains the only spoken narration; unverified claims are not added.
+  const adContext = S.kind === 'ads'
+    ? String(S.adBrief || '').replace(/\s+/g, ' ').slice(0, 7000)
+    : '';
   let prompts: { imagePrompt: string; searchQuery: string; emotion: string; title?: string }[] = parts.map((p) => ({ imagePrompt: `${style}, ${p.slice(0, 220)}`, searchQuery: p.split(/\s+/).filter((w) => w.length > 4).slice(0, 4).join(' '), emotion: 'neutral' }));
   // The script's own [tags], re-based onto each scene's words.
   const offsets: number[] = [];
@@ -4354,10 +4384,10 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   };
   let title = S.title;
   if (!CFG.offline) {
-    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).
-SCENES:
-${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}
-Return ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
+    const adInstruction = S.kind === 'ads'
+      ? `AD CAMPAIGN CONTEXT (guide visuals only; do not invent claims or add facts to spoken narration):\n${adContext || 'No product PDF facts supplied; use the user script and any live official website screenshot only.'}\n`
+      : '';
+    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).\n${adInstruction}SCENES:\n${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}\nReturn ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
     for await (const a of LLM.attempts({ system: 'You are a storyboard artist for animated videos. You answer with one JSON object.', user, json: true, temperature: 0.7, maxTokens: 3000, timeoutMs: 90000, task: 'studio_storyboard' })) {
       try {
         const j = extractJsonObject(a.text);
@@ -4408,12 +4438,61 @@ async function studioDeliver(S: StudioJob, meta: { title: string; durationSec: n
   if (!done || done.status >= 300) throw new PipelineError('upload_failed', `The video could not be saved (${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}).`);
 }
 
+async function applyStudioMusic(S: StudioJob, durationSec: number): Promise<void> {
+  if (S.musicMode === 'auto' || S.musicMode === 'none') return; // automatic score is fresh per job; none skips the score during rendering.
+  const input = OUTPUT_VIDEO;
+  const out = path.join(WORK_DIR, `studio_audio_${S.id}.mp4`);
+  if (!S.musicUrl) throw new PipelineError('music_missing', 'Background music was selected but no uploaded track was provided.');
+  const track = path.join(WORK_DIR, `studio_music_${S.id}.audio`);
+  const response = await fetch(`${CFG.appUrl.replace(/\/+$/, '')}${S.musicUrl}`, { headers: { 'X-Animato-Runner-Key': CFG.runnerKey } });
+  if (!response.ok) throw new PipelineError('music_fetch_failed', `Could not fetch uploaded background music (HTTP ${response.status}).`);
+  fs.writeFileSync(track, Buffer.from(await response.arrayBuffer()));
+  const r = await run('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',input,'-stream_loop','-1','-i',track,'-filter_complex', '[1:a]volume=0.18[bed];[0:a][bed]amix=inputs=2:duration=first:dropout_transition=2[a]','-map','0:v:0','-map','[a]','-c:v','copy','-c:a','aac','-b:a','192k','-t',String(durationSec),'-movflags','+faststart',out]);
+  if (r.code !== 0 || !fs.existsSync(out)) throw new PipelineError('music_mix_failed', 'Could not mix your background music into the video.');
+  fs.copyFileSync(out, input);
+}
+
 async function produceStudio(t0: number): Promise<number> {
   const S = STUDIO!;
   log(`Studio animation ${S.id}: ${S.kind}, ${S.voiceUrl ? 'your voice' : 'AI voice'}, ${S.cast.length} character(s), up to ${S.maxSeconds}s.`);
   await reportStatus('running', 'Preparing your animation', 6, 'Started.');
   if (S.cast[0]?.spec) CFG.characterSpec = S.cast[0].spec;
   CFG.gender = S.cast[0]?.gender || S.voiceGender;
+  CFG.targets.clear();
+  CFG.autoPost = false;
+
+  // ---- One-off music video from Tools (never an automation episode) ----
+  if (S.kind === 'musical') {
+    CFG.category = 'musical'; CFG.format = 'shorts'; CFG.aspect = '9:16';
+    CFG.musicalLyrics = String(S.script || '').slice(0, 3000);
+    CFG.musicLanguage = S.musicLanguage || 'English'; CFG.subGenre = S.subGenre || 'afrobeats';
+    CFG.stageId = S.stageMode === 'fixed' ? (S.stageId || 0) : 0;
+    CFG.topic = S.title || 'Original music video'; CFG.campaignName = S.title || 'Original music video';
+    (CFG as any).characterSpec = S.cast[0]?.spec || CFG.characterSpec;
+    await reportStatus('running', 'Creating your music video', 14, 'Generating the song, then animating your selected lead singer.');
+    const result = await produceMusical(t0, []);
+    return result;
+  }
+
+  // ---- One-off podcast from Tools (never an automation episode) ----
+  if (S.kind === 'podcast') {
+    CFG.category = 'podcast'; CFG.format = 'video'; CFG.aspect = '16:9';
+    CFG.podcastScript = String(S.script || '').slice(0, 8000);
+    CFG.castSpecs = Array.isArray(S.podcastHosts) && S.podcastHosts.length ? S.podcastHosts : S.cast.map((c) => c.spec).filter(Boolean);
+    CFG.studio = S.podcastStudio || CFG.studio;
+    CFG.podcastCast = 'custom'; CFG.podcastCastCount = Math.max(1, Math.min(3, CFG.castSpecs.length || 2));
+    CFG.presenterName = String(CFG.castSpecs[0]?.name || 'Host').slice(0, 32);
+    CFG.topic = S.title || 'Podcast'; CFG.campaignName = S.title || 'Podcast';
+    await reportStatus('running', 'Creating your podcast', 16, 'Preparing your selected hosts and studio.');
+    const out = await runAnimated(animKit() as any);
+    const outDur = await probeDuration(OUTPUT_VIDEO);
+    if (outDur < 2) throw new PipelineError('podcast_render_failed', `The podcast render is only ${outDur.toFixed(1)}s long.`);
+    if (S.watermark) await studioWatermark();
+    await reportStatus('running', 'Saving your podcast MP4', 92, `Rendered ${Math.round(outDur)}s.`);
+    await studioDeliver(S, { title: out.title || S.title || 'My Podcast', durationSec: Math.round(outDur) });
+    await reportStatus('completed', 'Your podcast is ready', 100, `Done in ${Math.round((Date.now() - t0) / 1000)}s.`);
+    return 0;
+  }
 
   // ---- Dialogue films: several characters talking in a place (the 2D film engine) ----
   if (S.kind === 'film') {
@@ -4433,6 +4512,7 @@ async function produceStudio(t0: number): Promise<number> {
     const out = await runAnimated(kit as any);
     const outDur = await probeDuration(OUTPUT_VIDEO);
     if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+    await applyStudioMusic(S, outDur);
     if (S.watermark) await studioWatermark();
     await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
     await studioDeliver(S, { title: out.title || S.title || 'My animation', durationSec: Math.round(outDur) });
@@ -4450,6 +4530,7 @@ async function produceStudio(t0: number): Promise<number> {
     const out = await runAnimated(animKit() as any);
     const outDur = await probeDuration(OUTPUT_VIDEO);
     if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+    await applyStudioMusic(S, outDur);
     if (S.watermark) await studioWatermark();
     await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
     await studioDeliver(S, { title: out.title || S.title || 'Stickman fight', durationSec: Math.round(outDur) });
@@ -4461,6 +4542,14 @@ async function produceStudio(t0: number): Promise<number> {
   // A story is pictures + voice-over unless the user added a storyteller.
   CFG.noCharacter = S.kind === 'story' && !S.showCharacter;
   CFG.category = ({ story: 'stories', kids: 'stories', talk: 'tech', motivation: 'tech', news: 'news', cooking: 'cooking', tech: 'tech', ads: 'ads' } as Record<string, string>)[S.kind] || 'tech';
+  if (S.kind === 'ads') {
+    CFG.adBrief = [String(S.adBrief || '').slice(0, 12000), S.adWebsiteUrl ? `Official website: ${S.adWebsiteUrl}` : ''].filter(Boolean).join('\n\n').slice(0, 14000);
+    CFG.adImages = Array.isArray(S.adImages) ? S.adImages.slice(0, 12) : [];
+    CFG.adProfile = { company: String(S.adProfile?.company || '').slice(0, 80), service: S.adProfile?.service === true, contact: String(S.adProfile?.contact || '').slice(0, 160) } as any;
+    if (!S.adWebsiteUrl && !S.adBrief) log('Ad brief is empty; generating a conservative ad from the user script only.');
+    if (S.adWebsiteUrl) log(`Ad website supplied by the user: ${S.adWebsiteUrl}`);
+    log(`Ad brief: ${(S.adBrief || '').split(/\s+/).filter(Boolean).length} words; ${CFG.adImages.length} PDF image(s).`);
+  }
   let narration: Narration, text: string;
   // [tags] in the user's script (turns, gestures, emotions) are direction, never spoken.
   const tagged = parseTaggedNarration(S.script || '');
@@ -4485,7 +4574,8 @@ async function produceStudio(t0: number): Promise<number> {
   const times = timeScenes(script.scenes, narration.words, duration);
   const cues = timeCues(script.scenes, narration.words, times);
   await reportStatus('running', 'Finding pictures for the scenes', 45, `${script.scenes.length} scenes.`);
-  const [{ files: images, credits }, music] = await Promise.all([gatherImages(script), findMusic(duration, narration)]);
+  const [{ files: images, credits }, generatedMusic] = await Promise.all([gatherImages(script), S.musicMode === 'none' || S.musicMode === 'upload' ? Promise.resolve([] as any[]) : findMusic(duration, narration)]);
+  const music = generatedMusic;
   await reportStatus('running', 'Animating your character', 62, 'Animating.');
   const badge = S.kind === 'kids' ? 'KIDS' : S.kind === 'story' ? 'STORY' : S.kind === 'talk' || S.kind === 'motivation' ? '' : S.kind.toUpperCase();
   const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title: script.title, badge, endCard: S.watermark ? 'Made with Animato Studio Pro' : '', music, duration, credits });
@@ -4495,6 +4585,7 @@ async function produceStudio(t0: number): Promise<number> {
   }
   const outDur = await probeDuration(OUTPUT_VIDEO);
   if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+  await applyStudioMusic(S, outDur);
   if (S.watermark) await studioWatermark();
   await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
   await studioDeliver(S, { title: script.title, durationSec: Math.round(outDur) });
