@@ -148,6 +148,8 @@ const CFG = {
   storyGenre: pick(JOB.story_genre, ENV.STORY_GENRE),
   animStyle: pick(JOB.anim_style, ENV.ANIM_STYLE),
   podcastAbout: pick(JOB.podcast_about, ENV.PODCAST_ABOUT),
+  podcastScript: pick(JOB.podcast_script, ENV.PODCAST_SCRIPT).slice(0, 8000),
+  musicalLyrics: pick(JOB.musical_lyrics, ENV.MUSICAL_LYRICS).slice(0, 3000),
   podcastGuests: pick(JOB.podcast_guests, ENV.PODCAST_GUESTS) === 'true',
   /** Musicals: the singer is the guest of her own show, interviewed about her latest songs. */
   podcastSinger: pick(JOB.podcast_singer, ENV.PODCAST_SINGER) === 'true',
@@ -3539,6 +3541,65 @@ Make it a song people replay: (1) the hook is short, punchy and instantly memora
   return null;
 }
 async function writeMusicalSong(pastTitles: string[]): Promise<MusicalSong> {
+  const manual = cleanMusicLyrics(String(CFG.musicalLyrics || '').slice(0, 3000));
+  if (manual) {
+    const aliases: Record<string, string> = { intro: 'intro', verse: 'verse', 'verse 1': 'verse', 'verse 2': 'verse', prechorus: 'prechorus', 'pre-chorus': 'prechorus', chorus: 'chorus', hook: 'chorus', bridge: 'bridge', outro: 'outro' };
+    const sections: MusicalSection[] = [];
+    let current: MusicalSection | null = null;
+    let sawSectionHeader = false;
+    for (const line of manual.split(/\n/)) {
+      const head = line.trim().match(/^\[?([a-z -]+(?: \d+)?)\]?:?$/i);
+      const tag = head ? aliases[head[1].trim().toLowerCase()] : null;
+      if (tag) { sawSectionHeader = true; current = { tag, lyrics: '', emotion: tag === 'chorus' ? 'excited' : 'calm' }; sections.push(current); continue; }
+      if (!current) { current = { tag: 'verse', lyrics: '', emotion: 'calm' }; sections.push(current); }
+      if (line.trim()) current.lyrics += `${current.lyrics ? '\n' : ''}${line.trim()}`;
+    }
+    let arranged = sections.filter((s) => s.lyrics.trim()).map((s) => ({ ...s, lyrics: s.lyrics.trim() }));
+    const lines = manual.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+    if (!arranged.length || !arranged.some((s) => s.tag === 'chorus')) {
+      // No section labels: turn the paste into a short intro/verse/hook/outro arrangement.
+      if (!sawSectionHeader) {
+        const intro = lines.slice(0, 2).join('\n');
+        const verse = lines.slice(2, Math.max(3, lines.length - 2)).join('\n');
+        const outro = lines.length > 4 ? lines.slice(-2).join('\n') : '';
+        arranged = [];
+        if (intro) arranged.push({ tag: 'intro', lyrics: intro, emotion: 'calm' });
+        if (verse) arranged.push({ tag: 'verse', lyrics: verse, emotion: 'calm' });
+        const hook = lines[Math.min(lines.length - 1, Math.max(0, Math.floor(lines.length / 2)))] || lines[0] || 'Sing it again';
+        const second = lines.find((x) => x !== hook) || hook;
+        arranged.push({ tag: 'chorus', lyrics: `${hook}\n${second}`, emotion: 'excited' });
+        if (outro) arranged.push({ tag: 'outro', lyrics: outro, emotion: 'happy' });
+      } else {
+        // Explicit sections without a chorus: use the strongest middle line as the refrain.
+        const refrain = lines[Math.min(lines.length - 1, Math.floor(lines.length / 2))] || lines[0] || 'Sing it again';
+        arranged.splice(Math.min(1, arranged.length), 0, { tag: 'chorus', lyrics: `${refrain}\n${refrain}`, emotion: 'excited' });
+      }
+    }
+    // Fit an approximately one-minute cut by prioritizing the chorus/hook, then intro/outro.
+    const wordCount = (s: string) => s.split(/\s+/).filter(Boolean).length;
+    const budget = 58; let used = 0;
+    const chorus = arranged.find((s) => s.tag === 'chorus');
+    const intro = arranged.find((s) => s.tag === 'intro');
+    const outro = arranged.find((s) => s.tag === 'outro');
+    const priority = [chorus, intro, outro, ...arranged.filter((s) => s !== chorus && s !== intro && s !== outro)].filter(Boolean) as MusicalSection[];
+    for (const sec of priority) {
+      const kept: string[] = [];
+      for (const line of sec.lyrics.split(/\n+/).map((x) => x.trim()).filter(Boolean)) {
+        const words = wordCount(line);
+        if (used + words <= budget) { kept.push(line); used += words; }
+      }
+      sec.lyrics = kept.join('\n');
+    }
+    arranged = arranged.filter((s) => s.lyrics.trim());
+    if (!arranged.some((s) => s.tag === 'chorus')) arranged.push({ tag: 'chorus', lyrics: (arranged[0]?.lyrics.split(/\n/)[0] || 'Sing it again'), emotion: 'excited' });
+    const repeated: MusicalSection[] = arranged.flatMap((s) => s.tag === 'chorus' ? [s, { ...s, emotion: s.emotion || 'excited' }] : [s]);
+    const lyrics = cleanMusicLyrics(sectionLyricText(repeated));
+    const firstLine = lines.find((x) => x && !/^\[/.test(x)) || 'Original song';
+    const title = clean(firstLine.replace(/^[^:]{1,24}:\s*/, '').replace(/[.!?].*$/, ''), 70) || 'Original song';
+    const gender = CFG.gender === 'male' ? 'male' : 'female';
+    const style = String(CFG.subGenre || 'original music');
+    return { title, description: `Original ${style} music video performed by a ${gender} lead singer.`, lyrics, sections: repeated, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
+  }
   const profile = musicalProfile();
   const gender = CFG.gender === 'male' ? 'male' : 'female';
   const already = pastTitles.slice(-20).join(' | ');

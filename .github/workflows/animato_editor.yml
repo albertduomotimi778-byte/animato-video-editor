@@ -59,12 +59,12 @@ jobs:
           ffmpeg -hide_banner -version | head -n 1
           nproc
 
-      # The app's own AI model (llama.cpp + Qwen3-4B) runs on this runner: no API keys.
+      # The app's own AI model (llama.cpp + Gemma 4 E4B/E2B) runs on this runner: no API keys.
       - name: Cache the AI model
         uses: actions/cache@v4
         with:
           path: ~/animato-llm
-          key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
+          key: animato-llm-gemma4-adaptive-q4_0-v3-${{ runner.os }}
 
       - name: Start the AI model (self-hosted)
         run: bash animato-cloud/llm_server.sh

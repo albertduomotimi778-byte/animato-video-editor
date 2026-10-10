@@ -45,7 +45,7 @@ export interface WebSource { title: string; uri: string }
 export interface LlmAttempt { provider: Provider; model: string; text: string; ms: number; sources?: WebSource[] }
 
 /** Default models (downloaded by the workflows). */
-export const LOCAL_TEXT_MODEL = 'Qwen3-4B-Instruct-2507 (Q4_K_M, llama.cpp)';
+export const LOCAL_TEXT_MODEL = 'Gemma 4 E4B/E2B IT QAT (Q4_0, llama.cpp)';
 export const LOCAL_VISION_MODEL = 'Qwen2.5-VL-3B-Instruct (Q4_K_M + mmproj, llama.cpp)';
 
 export class LlmPool {

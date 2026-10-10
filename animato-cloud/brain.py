@@ -307,7 +307,7 @@ def handle(job):
 
 
 def main():
-    models = {"text": "Qwen3-4B-Instruct-2507 Q4_K_M (llama.cpp)", "vision": "Qwen2.5-VL-3B-Instruct (on first use)", "stt": "Whisper small (faster-whisper)", "tts": "Piper"}
+    models = {"text": "Gemma 4 E4B/E2B IT QAT Q4_0 (llama.cpp)", "vision": "Qwen2.5-VL-3B-Instruct (on first use)", "stt": "Whisper small (faster-whisper)", "tts": "Piper"}
     r = api("POST", "/api/brain/runner/hello", json={"token": TOKEN, "models": models, "runUrl": os.environ.get("RUN_URL", "")})
     if r is None or not r.ok:
         log(f"the app refused this session ({r.status_code if r is not None else 'no answer'}) — stopping")

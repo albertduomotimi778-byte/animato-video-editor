@@ -2,7 +2,7 @@
 # Starts the app's own AI model on this GitHub runner — no API keys, no AI services.
 #
 #   llama.cpp (prebuilt CPU release, or built from source if the download fails)
-#   + Qwen3-4B-Instruct-2507 (Q4_K_M GGUF, ~2.5 GB) as an OpenAI-compatible server
+#   + Gemma 4 E4B IT QAT Q4_0 (CPU-compatible GGUF, 5.15 GB) or E2B fallback on low-memory runners as an OpenAI-compatible server
 #   on http://127.0.0.1:8080/v1. With "vision" as the first argument it also starts
 #   Qwen2.5-VL-3B-Instruct + its mmproj on :8081 (looking at pictures); "vision-only"
 #   starts just that one (the brain does this on first use).
@@ -11,9 +11,22 @@
 # Exports LOCAL_LLM_URL (and LOCAL_VLM_URL) to $GITHUB_ENV for the next steps.
 set -euo pipefail
 DIR="$HOME/animato-llm"
-LLAMA_TAG="${LLAMA_TAG:-b11435}"
-TEXT_REPO="${LLM_TEXT_REPO:-unsloth/Qwen3-4B-Instruct-2507-GGUF}"
-TEXT_FILE="${LLM_TEXT_FILE:-Qwen3-4B-Instruct-2507-Q4_K_M.gguf}"
+LLAMA_TAG="${LLAMA_TAG:-b11433}"
+# Use the stronger 4B-active-parameter Gemma 4 model when this runner has enough RAM;
+# fall back to the smaller E2B on low-memory/self-hosted runners to avoid OOM.
+if [ -n "${LLM_TEXT_REPO:-}" ] || [ -n "${LLM_TEXT_FILE:-}" ]; then
+  TEXT_REPO="${LLM_TEXT_REPO:-google/gemma-4-E4B-it-qat-q4_0-gguf}"
+  TEXT_FILE="${LLM_TEXT_FILE:-gemma-4-E4B_q4_0-it.gguf}"
+else
+  MEM_KB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  if [ "${MEM_KB:-0}" -ge 14000000 ]; then
+    TEXT_REPO="google/gemma-4-E4B-it-qat-q4_0-gguf"
+    TEXT_FILE="gemma-4-E4B_q4_0-it.gguf"
+  else
+    TEXT_REPO="google/gemma-4-E2B-it-qat-q4_0-gguf"
+    TEXT_FILE="gemma-4-E2B_q4_0-it.gguf"
+  fi
+fi
 VL_REPO="${LLM_VL_REPO:-ggml-org/Qwen2.5-VL-3B-Instruct-GGUF}"
 VL_FILE="${LLM_VL_FILE:-Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf}"
 VL_PROJ="${LLM_VL_PROJ:-mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf}"

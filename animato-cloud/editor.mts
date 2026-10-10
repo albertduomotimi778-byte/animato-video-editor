@@ -31,6 +31,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { LlmPool, extractJsonObject } from './llm.ts';
+import { composeWav, type MusicMood } from './music.ts';
 
 const ENV = process.env;
 const EVENT = (() => { try { return JSON.parse(fs.readFileSync(ENV.GITHUB_EVENT_PATH || '', 'utf8')); } catch { return {}; } })();
@@ -599,6 +600,26 @@ ${lines.join('\n')}
 `;
 }
 
+// Content-aware original-score choice. Each edit gets a seeded, newly synthesised score;
+// no stock recording is bundled or reused. Dialog is ducked underneath the voice.
+function musicMoodForText(text: string): MusicMood {
+  const t = text.toLowerCase();
+  if (/\b(horror|haunted|scary|ghost|fear|terrifying|nightmare|murder|creepy)\b/.test(t)) return 'horror';
+  if (/\b(mystery|detective|crime|investigat|secret|clue|suspense|thriller)\b/.test(t)) return 'mystery';
+  if (/\b(news|headline|breaking|politics|report|update|latest)\b/.test(t)) return 'news';
+  if (/\b(technology|tech|software|app|ai|phone|computer|digital|review|tutorial)\b/.test(t)) return 'tech';
+  if (/\b(cooking|recipe|food|kitchen|baking|meal|cook)\b/.test(t)) return 'upbeat';
+  if (/\b(comedy|funny|joke|prank|laugh|humour|humor)\b/.test(t)) return 'comedy';
+  if (/\b(action|fight|battle|race|adventure|challenge|competition|sports)\b/.test(t)) return 'action';
+  if (/\b(love|heartbreak|sad|emotional|memories|grief|hope|family|inspiring|inspiration)\b/.test(t)) return 'emotional';
+  return 'story';
+}
+function makeOriginalMusic(seconds: number, mood: MusicMood, seed: string, dest: string) {
+  // Bound synthesis memory for long uploads; FFmpeg loops the generated bed after ten minutes.
+  const duration = Math.max(3, Math.min(600, seconds));
+  fs.writeFileSync(dest, Buffer.from(composeWav(mood, duration, seed)));
+}
+
 // ---------------------------------------------------------------------------
 // 6. Render: pieces in parallel → joined → voice muxed
 // ---------------------------------------------------------------------------
@@ -641,7 +662,7 @@ function spliceVoice(pcm: Buffer, segs: Seg[], out: string) {
   fs.writeFileSync(out, Buffer.concat([header, Buffer.from(dst.buffer)]));
 }
 
-async function render(opts: { video: string; vInfo: Awaited<ReturnType<typeof probe>>; segs: Seg[]; W: number; H: number; ass: string | null; pcm: Buffer; out: string; onProgress: (done: number, total: number) => void }) {
+async function render(opts: { video: string; vInfo: Awaited<ReturnType<typeof probe>>; segs: Seg[]; W: number; H: number; ass: string | null; pcm: Buffer; out: string; musicText?: string; onProgress: (done: number, total: number) => void }) {
   const { segs, W, H, vInfo } = opts;
   const srcAR = vInfo.width / Math.max(1, vInfo.height), dstAR = W / H;
   const sameShape = Math.abs(srcAR - dstAR) / dstAR < 0.012;
@@ -673,7 +694,23 @@ async function render(opts: { video: string; vInfo: Awaited<ReturnType<typeof pr
   if (a.code !== 0) throw new EditError(`FFmpeg could not clean the voice: ${a.err.slice(-400)}`);
   const list = path.join(WORK, 'segments.txt');
   fs.writeFileSync(list, segs.map((_, i) => `file '${path.join(WORK, `seg_${String(i).padStart(4, '0')}.mp4`).replace(/'/g, "'\\''")}'`).join('\n'));
-  const m = await ff(['-f', 'concat', '-safe', '0', '-i', list, '-i', voice, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-shortest', '-movflags', '+faststart', opts.out]);
+  const finalDuration = segs.reduce((n, g) => n + g.frames / FPS, 0);
+  const addMusic = String(JOB.background_music ?? 'true') !== 'false';
+  let m;
+  if (addMusic) {
+    const text = String(opts.musicText || `${JOB.title || ''} ${JOB.instructions || ''}`).slice(0, 12000);
+    const mood = musicMoodForText(text);
+    const music = path.join(WORK, 'original_score.wav');
+    const seed = `${JOB_ID}:${String(JOB.title || '').slice(0, 120)}:${text.slice(0, 240)}`;
+    log(`Composing an original ${mood} score for this edit…`);
+    makeOriginalMusic(finalDuration, mood, seed, music);
+    // Music ducks under speech and rises slightly in pauses; the vocal itself is left intact.
+    m = await ff(['-f', 'concat', '-safe', '0', '-i', list, '-i', voice, '-stream_loop', '-1', '-i', music,
+      '-filter_complex', '[2:a]volume=0.20[bed];[bed][1:a]sidechaincompress=threshold=0.025:ratio=8:attack=18:release=280[ducked];[1:a][ducked]amix=inputs=2:duration=first:weights=1 0.90:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=9[mix]',
+      '-map', '0:v:0', '-map', '[mix]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-t', finalDuration.toFixed(3), '-shortest', '-movflags', '+faststart', opts.out]);
+  } else {
+    m = await ff(['-f', 'concat', '-safe', '0', '-i', list, '-i', voice, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-shortest', '-movflags', '+faststart', opts.out]);
+  }
   if (m.code !== 0 || !fs.existsSync(opts.out)) throw new EditError(`FFmpeg could not join the video: ${m.err.slice(-500)}`);
 }
 
@@ -752,7 +789,7 @@ async function main() {
     fs.writeFileSync(ass, captionsAss(segs, kept, W, H));
   }
   const out = path.join(WORK, 'edited.mp4');
-  await render({ video, vInfo, segs, W, H, ass, pcm, out, onProgress: (d, n) => {
+  await render({ video, vInfo, segs, W, H, ass, pcm, out, musicText: `${JOB.title || ''} ${JOB.instructions || ''} ${kept.map((x) => x.text).join(' ')}`.slice(0, 12000), onProgress: (d, n) => {
     if (Date.now() - lastReport > 8000) report('running', `5/5 Compiling the final video (${d}/${n})`, Math.round(60 + (28 * d) / n));
   } });
   lap('render');

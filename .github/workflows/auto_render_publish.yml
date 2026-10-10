@@ -110,14 +110,14 @@ jobs:
       # photos for everything else) — nothing is generated on this CPU, so there is no
       # image model to install and runs start minutes sooner.
 
-      # The app's own AI model (llama.cpp + Qwen3-4B) runs on this runner: no API keys.
+      # The app's own AI model (llama.cpp + Gemma 4 E4B/E2B) runs on this runner: no API keys.
       # Studio animations that bring their own words skip the writer model (much faster start).
       - name: Cache the AI model
         if: ${{ !github.event.client_payload.job.studio_needs || github.event.client_payload.job.studio_needs == 'llm' }}
         uses: actions/cache@v4
         with:
           path: ~/animato-llm
-          key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
+          key: animato-llm-gemma4-adaptive-q4_0-v3-${{ runner.os }}
 
       - name: Progress — AI writer
         if: ${{ !github.event.client_payload.job.studio_needs || github.event.client_payload.job.studio_needs == 'llm' }}

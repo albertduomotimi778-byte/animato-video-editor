@@ -4,7 +4,7 @@
 # when someone talks to the assistant or anything in the app needs AI. It keeps the
 # models loaded and answers the app's queued requests, then stops by itself after a
 # few idle minutes:
-#   • Qwen3-4B-Instruct (llama.cpp)         — chat, writing, plans, lyrics
+#   • Gemma 4 E4B/E2B (llama.cpp)         — chat, writing, plans, lyrics
 #   • Qwen2.5-VL-3B-Instruct + mmproj       — looking at pictures (loaded on first use)
 #   • Whisper small (faster-whisper)        — speech → text
 #   • Piper neural voices                   — text → speech
@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/animato-llm
-          key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
+          key: animato-llm-gemma4-adaptive-q4_0-v3-${{ runner.os }}
 
       - name: Cache the speech models
         uses: actions/cache@v4

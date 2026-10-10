@@ -406,8 +406,9 @@ async function podcast(kit: Kit): Promise<AnimResult> {
   const about = singerMode ? (songs.length ? `the inspiration behind ${songs.map((x) => `"${x.title}"`).join(', ')}` : 'her music and her latest concert') : clean(CFG.podcastAbout, 300);
   const topic = clean(CFG.topic || about || (/^podcast$/i.test(String(CFG.subGenre || '')) ? '' : CFG.subGenre) || 'the biggest story this week', 200);
   const queries = about && !CFG.topic ? about.split(/\s*,\s*/).filter(Boolean).slice(0, 3) : [topic];
+  const manualPodcastScript = String(CFG.podcastScript || '').trim();
   const news: { title: string; source: string }[] = [];
-  if (!singerMode) for (const q of queries) for (const h of await headlinesFor(kit, q)) if (news.length < 10 && !news.some((n) => n.title === h.title)) news.push(h);
+  if (!singerMode && !manualPodcastScript) for (const q of queries) for (const h of await headlinesFor(kit, q)) if (news.length < 10 && !news.some((n) => n.title === h.title)) news.push(h);
   const shorts = lengthOf(kit);
   const n = shorts ? '12-16 lines, 130-160 words in total (under 60 seconds)' : '40-60 lines, 480-620 words in total (3-4 minutes)';
   const guestMode = !singerMode && !!CFG.podcastGuests && hosts.length > 1;
@@ -443,13 +444,40 @@ ${CFG.performanceNotes ? `WHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CF
 ${foreign
   ? `Return ONLY JSON: {"title": "catchy episode title in ${lang!.name} (max 60 chars)", "title_en": "the same title in English", "description": "2-3 sentences for YouTube, in English", "hashtags": ["5-8 specific hashtags without #"], "lines": [{"host": 1, "text": "[excited] the line in ${lang!.name}", "en": "the English translation"}]}`
   : `Return ONLY JSON: {"title": "catchy episode title (max 70 chars)", "description": "2-3 sentences for YouTube", "hashtags": ["5-8 specific hashtags without #"], "lines": [{"host": 1, "text": "[excited] Line text"}]}`}`;
-  const got = await askJson(kit, 'You write natural, factual podcast conversations. You answer with one JSON object.', user, (j) => {
+  const got = manualPodcastScript ? null : await askJson(kit, 'You write natural, factual podcast conversations. You answer with one JSON object.', user, (j) => {
     if (!Array.isArray(j.lines) || j.lines.length < (shorts ? 8 : 25)) return 'too few lines';
     if (j.lines.some((l: any) => !(Number(l.host) >= 1 && Number(l.host) <= hosts.length) || !clean(l.text))) return 'bad line';
     if (foreign && j.lines.filter((l: any) => clean(l.en)).length < j.lines.length * 0.8) return 'missing English translations';
     return null;
   }, 'podcast_script');
-  const script = got?.j || {
+  const manualLines = manualPodcastScript ? (() => {
+    const hostNames = hosts.map((h) => h.name.toLowerCase());
+    const rawLines = manualPodcastScript.replace(/\r/g, '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
+    const out: { host: number; text: string; en?: string }[] = [];
+    let lastHost = 0;
+    const addText = (raw: string, forcedHost?: number) => {
+      // Split long paragraphs into short lines so captions and TTS remain readable.
+      const parts = raw.match(/[^.!?]+[.!?]?/g) || [raw];
+      for (const part of parts) {
+        const sentence = clean(part, 800); if (!sentence) continue;
+        const chunks = sentence.length > 360 ? sentence.match(/.{1,300}(?:\s|$)/g) || [sentence] : [sentence];
+        for (const chunk of chunks) { const text = clean(chunk, 360); if (!text) continue; const host = forcedHost ?? (lastHost % hosts.length); out.push({ host: host + 1, text, en: text }); lastHost = (host + 1) % hosts.length; }
+      }
+    };
+    for (const line of rawLines) {
+      const m = line.match(/^\s*(?:\[?([a-zA-Z][\w .'-]{0,24})\]?|(?:host|speaker)\s*(\d+))\s*:\s*(.+)$/i);
+      if (m) {
+        let hostIndex = -1;
+        const label = String(m[1] || '').trim().toLowerCase();
+        if (m[2]) hostIndex = Math.max(0, Math.min(hosts.length - 1, Number(m[2]) - 1));
+        else if (/^(host|speaker)\s*\d+$/.test(label)) hostIndex = Math.max(0, Math.min(hosts.length - 1, Number(label.match(/\d+/)?.[0] || 1) - 1));
+        else hostIndex = hostNames.findIndex((n) => n === label || n.startsWith(label));
+        addText(m[3], hostIndex >= 0 ? hostIndex : undefined);
+      } else addText(line);
+    }
+    return out.slice(0, 120);
+  })() : null;
+  const script = manualPodcastScript ? { title: clean((manualPodcastScript.split(/\n/).find((x) => x.trim()) || 'Podcast episode').replace(/^.*?:\s*/, ''), 70), description: `Creator-written episode of ${studio.showName}.`, hashtags: ['podcast', 'originalscript'], lines: manualLines || [] } : got?.j || {
     title: singerMode ? `${star.name}: the stories behind the songs` : `${topic}: what everyone is missing`, description: singerMode ? `${star.name} joins ${studio.showName} to talk about ${topic}.` : `The hosts of ${studio.showName} talk about ${topic}.`, hashtags: singerMode ? ['podcast', 'music', 'interview'] : ['podcast', 'talk'],
     lines: [
       ...(singerMode ? [
@@ -471,7 +499,8 @@ ${foreign
     ]),
     ],
   };
-  if (!got && !CFG.allowFallbackPublish && !CFG.offline && !CFG.dryRun) throw new kit.PipelineError('script_retry', 'The AI model on the runner could not write the podcast script this time. Nothing was posted; the next attempt runs automatically.');
+  if (manualPodcastScript && (!script.lines || script.lines.length < 2)) throw new kit.PipelineError('manual_script_invalid', 'Please add at least two readable lines to your podcast script.');
+  if (!got && !manualPodcastScript && !CFG.allowFallbackPublish && !CFG.offline && !CFG.dryRun) throw new kit.PipelineError('script_retry', 'The AI model on the runner could not write the podcast script this time. Nothing was posted; the next attempt runs automatically.');
   await kit.reportStatus('running', '2/5 Recording the hosts', 22, `Script ready: "${clean(script.title, 90)}" (${script.lines.length} lines${got ? `, ${got.model}` : ''}).`);
 
   // Voices: one per host, distinct.
