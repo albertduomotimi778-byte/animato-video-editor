@@ -3747,64 +3747,119 @@ async function saveAceAudio(buf: Buffer, label: string) {
   if (fs.statSync(out).size < 10000) throw new PipelineError('acestep_busy', `ACE-Step (${label}) returned an empty audio clip.`);
   return { file: out, duration: await probeDuration(out) };
 }
-async function aceStepNative(song: MusicalSong, apiKey: string, fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
-  const r = aceStepRequest(song);
-  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8', 'User-Agent': 'curl/8.7.1' };
-  // "thinking" (the 5Hz planning LM) gives better songs but is slower; the retry rounds switch it off.
+/** Readable reason from an ACE cloud error body (JSON detail, or an HTML error page). */
+function aceReason(status: number, text: string): string {
+  try { const j = JSON.parse(text); const d = j?.detail || j?.error?.message || j?.error || j?.message; if (d) return String(typeof d === 'string' ? d : JSON.stringify(d)).slice(0, 240); } catch { /* not JSON */ }
+  if (/<html/i.test(text)) { const t = text.match(/<title>([^<]*)<\/title>/i)?.[1] || ''; return `${status === 504 || status === 524 ? 'the music cloud timed out' : 'the music cloud is unavailable'}${t ? ` (${t.trim().slice(0, 80)})` : ''}`; }
+  return text.replace(/\s+/g, ' ').trim().slice(0, 240) || `HTTP ${status}`;
+}
+const ACE_MODEL_GUESSES = ['acemusic/acestep-v1.5-turbo', 'acemusic/acestep-v15-turbo', ''];
+let aceModelId = '';
+/** The cloud lists its model at /v1/models; the first one listed is the one ACE's own client uses. */
+async function aceCloudModel(apiKey: string): Promise<string> {
+  if (CFG.acestepModel) return CFG.acestepModel;
+  if (aceModelId) return aceModelId;
+  try {
+    const r = await fetch(`${CFG.acestepBase}/v1/models`, { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json', 'User-Agent': 'curl/8.7.1' }, signal: AbortSignal.timeout(20000) });
+    const j: any = await r.json().catch(() => ({}));
+    const id = (Array.isArray(j?.data) ? j.data : []).map((m: any) => String(m?.id || '')).filter(Boolean)[0] || '';
+    if (id) { aceModelId = id; return id; }
+  } catch { /* use the guesses */ }
+  return ACE_MODEL_GUESSES[0];
+}
+type AceCall = { ok: true; buf: Buffer } | { ok: false; status: number; error: string };
+/** One request to the ACE Music cloud (OpenAI-style /v1/chat/completions). Streams so a long song is not cut by a gateway timeout. */
+async function aceCloudCall(apiKey: string, r: ReturnType<typeof aceStepRequest>, model: string, stream: boolean): Promise<AceCall> {
+  const lang = !r.lang || r.lang === 'pcm' || r.lang === 'unknown' ? 'en' : String(r.lang).slice(0, 8);
   const body: any = {
-    prompt: r.prompt, caption: r.prompt, lyrics: r.lyrics, audio_duration: r.target, audio_format: 'mp3', batch_size: 1, vocal_language: r.lang,
-    ...(r.bpm ? { bpm: r.bpm } : {}), ...(r.key ? { key_scale: r.key } : {}), time_signature: '4',
-    thinking: !fast, use_cot_caption: false, ai_token: apiKey, ...(CFG.acestepModel ? { model: CFG.acestepModel } : {}),
+    messages: [{ role: 'user', content: `<prompt>${String(r.prompt).slice(0, 500)}</prompt><lyrics>${r.lyrics || '[Instrumental]'}</lyrics>` }],
+    stream, thinking: false, use_format: false, sample_mode: false, use_cot_caption: false, use_cot_language: false,
+    audio_config: { duration: Math.max(20, Math.min(300, Math.round(r.target) || 60)), vocal_language: r.lyrics ? lang : 'en', format: 'mp3', ...(r.bpm ? { bpm: r.bpm } : {}), ...(r.lyrics ? {} : { instrumental: true }) },
   };
-  let taskId = '';
-  for (let attempt = 0; attempt < 3 && !taskId; attempt++) {
-    if (attempt) await sleep(8000 * attempt);
-    try {
-      const rel = await fetch(`${CFG.acestepBase}/release_task`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(180000) });
-      const txt = await rel.text();
-      let rj: any = {}; try { rj = JSON.parse(txt); } catch {}
-      taskId = String(rj?.data?.task_id || rj?.task_id || '').trim();
-      if (!rel.ok || !taskId) {
-        const code = aceErrCode(rel.status, txt);
-        const err = new PipelineError(code, `ACE-Step request failed (HTTP ${rel.status}): ${String(rj?.error || rj?.message || txt).slice(0, 200)}`);
-        if (code !== 'acestep_busy' || attempt === 2) throw err;
-        log(`⚠️ ${err.message} — retrying…`); taskId = '';
+  if (model) body.model = model;
+  let res: Response;
+  try {
+    res = await fetch(`${CFG.acestepBase}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8', Accept: stream ? 'text/event-stream' : 'application/json', 'User-Agent': 'curl/8.7.1' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(Math.max(60000, Math.min(12 * 60 * 1000, aceLeft()))),
+    });
+  } catch (e: any) { return { ok: false, status: 0, error: String(e?.message || e) }; }
+  if (!res.ok) { const t = await res.text().catch(() => ''); return { ok: false, status: res.status, error: aceReason(res.status, t) }; }
+  let url = '';
+  try {
+    if (/json/.test(res.headers.get('content-type') || '')) {
+      const j: any = await res.json().catch(() => ({}));
+      url = j?.choices?.[0]?.message?.audio?.[0]?.audio_url?.url || '';
+      if (!url) return { ok: false, status: 500, error: String(j?.detail || j?.error?.message || (j?.choices?.[0]?.finish_reason === 'error' ? j?.choices?.[0]?.message?.content : '') || 'the cloud answered without audio').slice(0, 300) };
+    } else {
+      // Server-sent events: heartbeats every few seconds, then a chunk carrying the audio, then [DONE].
+      const reader = res.body!.getReader(); const dec = new TextDecoder();
+      let buf = '', lastErr = '', lastBeat = 0;
+      const eat = (line: string) => {
+        line = line.trim();
+        if (!line.startsWith('data:')) return;
+        const data = line.slice(5).trim();
+        if (!data || data === '.' || data === '[DONE]') return;
+        try {
+          const j = JSON.parse(data);
+          const d = j?.choices?.[0]?.delta || j?.choices?.[0]?.message || {};
+          const u = d?.audio?.[0]?.audio_url?.url;
+          if (u) url = u;
+          if (j?.choices?.[0]?.finish_reason === 'error' || j?.error) lastErr = String(j?.error?.message || j?.error || d?.content || 'generation error');
+        } catch { /* partial line */ }
+      };
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        if (Date.now() - lastBeat > 15000) { lastBeat = Date.now(); void aceStatus('ACE Music cloud is composing'); }
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) { eat(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
       }
-    } catch (e: any) {
-      if (e instanceof PipelineError) throw e;
-      if (attempt === 2) throw new PipelineError('acestep_busy', `ACE-Step did not accept the song request (${e?.message || e}).`);
-      log(`⚠️ ACE-Step request attempt ${attempt + 1} failed (${e?.message || e}); retrying…`);
+      if (buf) eat(buf);
+      if (!url) return { ok: false, status: 500, error: lastErr || 'the stream ended without audio' };
     }
+  } catch (e: any) { return { ok: false, status: 0, error: `the song stream was interrupted (${e?.message || e})` }; }
+  const m = url.match(/^data:[^,]*;base64,(.+)$/s);
+  if (m) return { ok: true, buf: Buffer.from(m[1].replace(/\s+/g, ''), 'base64') };
+  if (!/^https?:/i.test(url)) return { ok: false, status: 500, error: 'unknown audio format' };
+  for (let d = 0; d < 3; d++) {
+    try {
+      const dl = await fetch(url, { headers: { 'User-Agent': 'curl/8.7.1' }, signal: AbortSignal.timeout(240000) });
+      if (!dl.ok) throw new Error(`HTTP ${dl.status}`);
+      return { ok: true, buf: Buffer.from(await dl.arrayBuffer()) };
+    } catch (e: any) { if (d === 2) return { ok: false, status: 500, error: `audio download failed: ${e?.message || e}` }; await sleep(4000); }
   }
-  log(`🎵 ACE-Step task ${taskId.slice(0, 24)} accepted${fast ? ' (fast mode)' : ''}; waiting for the song…`);
-  const started = Date.now();
-  for (let attempt = 0; Date.now() - started < Math.min(15 * 60 * 1000, aceLeft()); attempt++) {
-    await sleep(attempt < 15 ? 2500 : 5000);
-    let q: Response;
-    try { q = await fetch(`${CFG.acestepBase}/query_result`, { method: 'POST', headers, body: JSON.stringify({ task_id_list: [taskId] }), signal: AbortSignal.timeout(45000) }); }
-    catch { continue; }
-    const qj: any = await q.json().catch(() => ({}));
-    if (!q.ok) { if (q.status === 429 || q.status >= 500) continue; throw new PipelineError(aceErrCode(q.status, JSON.stringify(qj)), `ACE-Step status check failed (HTTP ${q.status}).`); }
-    const item = Array.isArray(qj?.data) ? qj.data[0] : Array.isArray(qj) ? qj[0] : qj?.data;
-    const status = Number(item?.status ?? 0);
-    if (status === 2) throw new PipelineError('acestep_busy', `ACE-Step could not generate the song: ${String(item?.error || item?.result || 'failed').slice(0, 200)}`);
-    if (status !== 1) { if (attempt % 8 === 0) log(`🎵 ACE-Step still generating (${Math.round((Date.now() - started) / 1000)}s)…`); continue; }
-    let res: any = item?.result;
-    if (typeof res === 'string') { try { res = JSON.parse(res); } catch { res = []; } }
-    const first = Array.isArray(res) ? res[0] : res;
-    const fileRef = String(first?.file || first?.audio_url || first?.url || '');
-    if (!fileRef) throw new PipelineError('acestep_busy', 'ACE-Step finished but returned no audio file.');
-    if (/^data:audio/i.test(fileRef)) return { ...(await saveAceAudio(Buffer.from(fileRef.split(',')[1] || '', 'base64'), 'async')), taskId };
-    const url = /^https?:\/\//i.test(fileRef) ? fileRef : `${CFG.acestepBase}${fileRef.startsWith('/') ? '' : '/'}${fileRef}`;
-    for (let d = 0; d < 3; d++) {
-      try {
-        const dl = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(240000) });
-        if (!dl.ok) throw new Error(`HTTP ${dl.status}`);
-        return { ...(await saveAceAudio(Buffer.from(await dl.arrayBuffer()), 'async')), taskId };
-      } catch (e: any) { if (d === 2) throw new PipelineError('acestep_busy', `ACE-Step audio download failed: ${e?.message || e}`); await sleep(5000); }
+  return { ok: false, status: 500, error: 'audio download failed' };
+}
+async function aceStepNative(song: MusicalSong, apiKey: string, _fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
+  const r = aceStepRequest(song);
+  let model = await aceCloudModel(apiKey);
+  let res: AceCall = { ok: false, status: 0, error: 'not started' };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { log(`⚠️ ACE Music cloud: ${(res as any).error} — retrying…`); await sleep(8000 * attempt); }
+    if (aceLeft() < 30000) break;
+    res = await aceCloudCall(apiKey, r, model, true);
+    // Wrong model name: try the other known names (and none), and remember the one that works.
+    if (!res.ok && [400, 404, 422].includes(res.status) && /model/i.test(res.error)) {
+      for (const alt of ACE_MODEL_GUESSES.filter((x) => x !== model)) {
+        res = await aceCloudCall(apiKey, r, alt, true);
+        if (res.ok || !/model/i.test(res.error)) { model = alt; aceModelId = alt; break; }
+      }
     }
+    // Streaming answered without audio or was cut: ask once the plain (non-streaming) way.
+    if (!res.ok && res.status !== 401 && res.status !== 403 && res.status !== 429 && res.status < 500 && res.status !== 404) {
+      const plain = await aceCloudCall(apiKey, r, model, false);
+      res = plain.ok ? plain : { ...plain, error: `${plain.error} (streaming: ${res.error})` };
+    }
+    if (res.ok) break;
+    // Only a busy / unreachable service is worth asking again with the same key.
+    if (aceErrCode(res.status, res.error) !== 'acestep_busy' && res.status !== 0) break;
   }
-  throw new PipelineError('acestep_busy', `ACE-Step task ${taskId} did not finish in time (${Math.round((Date.now() - started) / 60000)} min).`);
+  if (!res.ok) throw new PipelineError(res.status === 0 ? 'acestep_busy' : aceErrCode(res.status, res.error), `ACE Music cloud request failed (HTTP ${res.status || 'no answer'}): ${res.error}`);
+  const saved = await saveAceAudio(res.buf, 'cloud');
+  return { ...saved };
 }
 /** Google Lyria via the Gemini API (Interactions). PAID — only used when LYRIA_ENABLED=true and a billing-enabled Gemini key is set. */
 async function generateLyriaMusic(song: MusicalSong): Promise<{ file: string; duration: number; taskId?: string }> {
