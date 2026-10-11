@@ -375,6 +375,144 @@ function autoCast(seed: string, n: number, avoid: string[] = []): { autoHost: tr
 const lengthOf = (kit: Kit) => kit.IS_SHORTS;
 
 // ===========================================================================
+// PODCAST SCRIPT HELPERS — faithful parsing + automatic "direction" (tags)
+// ===========================================================================
+const STAGE_DIRECTIONS: [RegExp, string][] = [
+  [/[(*]\s*(?:laughs?|laughing|chuckles?|giggles?)\s*[)*]/gi, '[laugh] '],
+  [/[(*]\s*(?:nods?|nodding)\s*[)*]/gi, '[nod] '],
+  [/[(*]\s*(?:shrugs?|shrugging)\s*[)*]/gi, '[shrug] '],
+  [/[(*]\s*(?:smiles?|smiling|grins?)\s*[)*]/gi, '[happy] '],
+  [/[(*]\s*(?:sighs?|sighing)\s*[)*]/gi, '[sad] '],
+  [/[(*]\s*(?:thinks?|thinking|ponders?|pauses?)\s*[)*]/gi, '[think] '],
+  [/[(*]\s*(?:points?|pointing)\s*[)*]/gi, '[point] '],
+  [/[(*]\s*(?:leans? in|leaning in)\s*[)*]/gi, '[lean_in] '],
+];
+const NOT_A_SPEAKER = new Set(['note', 'notes', 'title', 'topic', 'episode', 'intro', 'outro', 'scene', 'music', 'sound', 'sfx', 'cut', 'narrator', 'summary', 'script', 'step', 'tip', 'example', 'warning', 'result', 'question', 'answer', 'fact', 'idea']);
+const ABBREV = /\b(Mr|Mrs|Ms|Dr|Prof|St|vs|etc|No|Jr|Sr)\./g;
+
+/**
+ * Reads the creator's script EXACTLY as written: every spoken word is kept, in order, nothing is added.
+ * Only speaker labels ("Maya:", "Host 2:", "**Sam**:") and stage directions in (brackets) are taken out of the
+ * spoken text — and each removed fragment is reported so nothing disappears silently.
+ */
+function parseManualScript(raw: string, hostNames: string[]): { title: string; lines: { host: number; text: string; en: string }[]; removed: string[]; truncated: boolean } {
+  const hostCount = Math.max(1, hostNames.length);
+  const lowNames = hostNames.map((n) => n.toLowerCase());
+  const removed: string[] = [];
+  const rawLines = raw.replace(/\r/g, '').split(/\n+/).map((l) => l.replace(/^\s*(?:[-•*]\s+|\d+[.)]\s+)/, '').trim()).filter(Boolean);
+
+  // Speaker labels: a known host name, "Host 2"/"Speaker 1", or any short capitalised name used on several lines.
+  const labelRe = /^\s*[*_]{0,3}\[?([A-Za-z\u00C0-\u024F][\w\u00C0-\u024F.'-]*(?: [A-Za-z\u00C0-\u024F][\w\u00C0-\u024F.'-]*)?)\]?[*_]{0,3}\s*(?:\(([^)]{1,30})\))?\s*[*_]{0,3}\s*[:：]\s*[*_]{0,3}\s*(.*)$/;
+  const counts = new Map<string, number>(); const firstSeen: string[] = [];
+  for (const l of rawLines) { const m = l.match(labelRe); if (!m) continue; const k = m[1].trim().toLowerCase(); if (NOT_A_SPEAKER.has(k)) continue; counts.set(k, (counts.get(k) || 0) + 1); if (!firstSeen.includes(k)) firstSeen.push(k); }
+  const labelHost = new Map<string, number>();
+  const used = new Set<number>();
+  for (const k of firstSeen) {
+    let idx = -1;
+    const num = k.match(/^(?:host|speaker|guest|presenter|h)\s*(\d+)$/);
+    if (num) idx = Math.min(hostCount, Math.max(1, Number(num[1]))) - 1;
+    else idx = lowNames.findIndex((n) => n === k || n.split(' ')[0] === k.split(' ')[0]);
+    if (idx >= 0) { labelHost.set(k, idx); used.add(idx); }
+  }
+  // Unknown but repeated names ("Alex:" / "Sam:") take the remaining hosts in order of appearance.
+  for (const k of firstSeen) if (!labelHost.has(k) && (counts.get(k) || 0) >= 2) { let idx = 0; while (idx < hostCount && used.has(idx)) idx++; if (idx < hostCount) { labelHost.set(k, idx); used.add(idx); } }
+
+  let title = '';
+  const out: { host: number; text: string; en: string }[] = [];
+  let lastHost = hostCount - 1, truncated = false;
+  rawLines.forEach((line0, li) => {
+    let line = line0, forced = -1, mood = '';
+    const t = line.match(/^(?:title|episode title|episode)\s*[:\-–—]\s*(.+)$/i);
+    if (t && li === 0) { title = t[1].replace(/[*_#]/g, '').trim(); removed.push(line.slice(0, 40)); return; }
+    const m = line.match(labelRe);
+    if (m && labelHost.has(m[1].trim().toLowerCase())) {
+      forced = labelHost.get(m[1].trim().toLowerCase())!; line = m[3];
+      const hint = String(m[2] || '').toLowerCase().replace(/\s+/g, '_');
+      if (hint && (EMO_TAGS.includes(hint) || GESTURE_TAGS.includes(hint))) mood = `[${hint}] `;
+      removed.push(`${m[1].trim()}:`);
+    }
+    for (const [re, tag] of STAGE_DIRECTIONS) line = line.replace(re, tag);
+    // A line that is only a direction, e.g. "[Intro music]" or "(both laugh)", is not spoken.
+    const spokenProbe = line.replace(/\[[a-z_ ]+\]/gi, ' ').replace(/[*_#`>~]/g, '').trim();
+    if (!spokenProbe || /^[\[(].*[\])]$/.test(spokenProbe)) { removed.push(line0.slice(0, 40)); return; }
+    const host = forced >= 0 ? forced : (lastHost + 1) % hostCount;
+    lastHost = host;
+    // Short, caption-sized pieces: split at sentence ends (not at decimals or "Dr."), keep very short sentences together.
+    const safe = (mood + line).replace(ABBREV, (x) => x.replace('.', '\u0001'));
+    const sentences = safe.split(/(?<=[.!?…]["')\]”]?)\s+(?=[\[("'“]?[A-Z0-9¿¡])/).map((x) => x.replace(/\u0001/g, '.').trim()).filter(Boolean);
+    const pieces: string[] = [];
+    for (const sn of sentences) {
+      const wc = sn.replace(/\[[^\]]*\]/g, '').trim().split(/\s+/).filter(Boolean).length;
+      if (pieces.length && wc < 4) pieces[pieces.length - 1] += ' ' + sn; else pieces.push(sn);
+    }
+    for (const piece of pieces) {
+      // Very long sentences break at a comma or space, never mid-word.
+      const chunks = piece.length > 360 ? (piece.match(/.{1,300}(?:[,;]\s|\s|$)/g) || [piece]) : [piece];
+      for (const c of chunks) { const text = c.replace(/\s+/g, ' ').trim(); if (text) out.push({ host: host + 1, text, en: text.replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim() }); }
+    }
+  });
+  if (out.length > 200) truncated = true;
+  return { title, lines: out.slice(0, 200), removed, truncated };
+}
+
+/**
+ * The "director": reads one spoken line and places performance tags (emotion at the start; gestures right before the
+ * word they belong to). Tags the creator or the AI already wrote are kept as they are; nothing here changes a spoken word.
+ * Heads turning toward the co-host is handled automatically by the stage, so no turn/look tags are written here.
+ */
+function directLine(raw: string, o: { first: boolean; last: boolean }): string {
+  const toks = raw.split(/\s+/).filter(Boolean);
+  const present = toks.map((t) => (t.match(/^\[([a-z_ ]+)\]$/i)?.[1] || '').toLowerCase().replace(/\s+/g, '_')).filter(Boolean);
+  const hasEmo = present.some((t) => EMO_TAGS.includes(t)), hasGest = present.some((t) => GESTURE_TAGS.includes(t));
+  if (hasEmo && hasGest) return raw;
+  const words = toks.filter((t) => !/^\[[^\]]*\]$/.test(t));
+  const plain = words.join(' '), low = plain.toLowerCase(), n = words.length;
+  const wordIndex = (re: RegExp) => { const m = re.exec(low); return m ? low.slice(0, m.index).split(/\s+/).filter(Boolean).length : -1; };
+  const ins: { at: number; tag: string }[] = [];
+  if (!hasEmo) {
+    let emo = '';
+    if (/\b(haha+|lol|hilarious|so funny|that's funny|joke|cracking up|laughing)\b/.test(low)) emo = 'laugh';
+    else if (o.first || /\b(welcome|hello|hi everyone|good to see|thank you|thanks)\b/.test(low)) emo = 'happy';
+    else if (/\b(wow|amazing|incredible|unbelievable|can't believe|awesome|fantastic|so excited|love (it|this|that))\b/.test(low)) emo = 'excited';
+    else if (/\b(sad|sorry|unfortunately|heartbreaking|tragic|grief|painful|hurts?)\b/.test(low)) emo = 'sad';
+    else if (/\b(scary|afraid|scared|terrified|fear|dangerous|panic)\b/.test(low)) emo = 'scared';
+    else if (/\b(worried|worry|concerned|concern|risky|risk|problem|trouble|careful|warning)\b/.test(low)) emo = 'worried';
+    else if (/\b(angry|furious|outrageous|ridiculous|unacceptable|hate|annoying|disgusting)\b/.test(low)) emo = 'angry';
+    else if (/\b(really|seriously|no way|wait|surprising|shocked|didn't expect|can't be)\b/.test(low) && /[?!]/.test(plain)) emo = 'surprised';
+    else if (/\?\s*$/.test(plain)) emo = 'curious';
+    else if (/\b(important|serious|truth|critical|must|the fact)\b/.test(low)) emo = 'serious';
+    else if (/!\s*$/.test(plain)) emo = 'happy';
+    if (emo) ins.push({ at: 0, tag: emo });
+  }
+  if (!hasGest) {
+    const g: { at: number; tag: string }[] = [];
+    const add = (re: RegExp, tag: string, at = wordIndex(re)) => { if (g.length >= 2 || at < 0 || g.some((x) => Math.abs(x.at - at) < 3 || x.tag === tag)) return; g.push({ at, tag }); };
+    if (o.first) add(/\b(welcome|hello|hi|hey)\b/, 'wave');
+    if (o.last) add(/\b(bye|see you|follow|subscribe|thanks for (watching|listening)|next episode)\b/, 'wave');
+    add(/^(yes|yeah|yep|yup|exactly|right|true|absolutely|totally|correct|indeed|sure|agreed|fair|good point|that's true|that's right|of course)\b/, 'nod');
+    add(/^(no|nope|not really|i disagree|i don't think|never|wrong|that's not|actually,? no|nah)\b/, 'shake_head');
+    add(/\b(i don't know|who knows|not sure|no idea|i guess|it depends|maybe|perhaps|kind of|sort of)\b/, 'shrug');
+    add(/\b(hmm+|let me think|i wonder|what if|imagine|think about|think of)\b/, 'think');
+    add(/\b(first(ly)?|second(ly)?|third(ly)?|number (one|two|three)|step (one|two|three)|three (things|ways|reasons)|two (things|ways|reasons))\b/, 'count');
+    add(/\b(i feel|i believe|honestly|personally|my heart|i promise|to be honest|from the heart|i care|i swear)\b/, 'hand_chest');
+    add(/\b(everyone|everybody|everything|the whole|so many|huge|massive|all of us|entire)\b/, 'hands_up');
+    add(/\b(secret|between us|here's the thing|guess what|the truth is|want to know|listen)\b/, 'lean_in');
+    add(/\b(look at|you see|you need|you should|you have to)\b/, 'point');
+    if (!g.length && /\?\s*$/.test(plain) && n >= 5) g.push({ at: Math.max(0, n - 4), tag: 'lean_in' });
+    if (!g.length && n >= 12) g.push({ at: Math.min(3, n - 1), tag: 'explain' });
+    ins.push(...g);
+  }
+  if (!ins.length) return raw;
+  const out: string[] = []; let wi = 0;
+  for (const tk of toks) {
+    if (/^\[[^\]]*\]$/.test(tk)) { out.push(tk); continue; }
+    for (const x of ins) if (x.at === wi) out.push(`[${x.tag}]`);
+    out.push(tk); wi++;
+  }
+  return out.join(' ');
+}
+
+// ===========================================================================
 // PODCAST
 // ===========================================================================
 async function podcast(kit: Kit): Promise<AnimResult> {
@@ -439,7 +577,8 @@ ${songs.length ? songs.map((x, i) => `${i + 1}. "${x.title}"${x.genre ? ` (${x.g
 INTERVIEW: for every song the hosts ask about the INSPIRATION — the moment, person or feeling behind it, what the lyrics really mean (she may quote one short line ONLY from the lyrics given above), how the band and backup singers built it, and how the crowd reacted at the concert. Follow-up questions, laughs and honest emotion. ${star.name} speaks about 45% of the lines, each host about a quarter. End with what she is working on next, the hosts thank ${star.name} by name and ask viewers to follow.
 Never invent awards, chart positions, sales or real collaborators.
 ` : ''}${about && !CFG.topic && !singerMode ? `ANGLE: a roundup of the latest in ${about} — what just happened, why it matters, the hosts' honest takes, and bold predictions about the next big thing (clearly framed as speculation).\n` : ''}HOW IT SOUNDS: a real conversation between friends who know the subject — quick back-and-forth, reactions ("wait, really?"), a disagreement, a laugh, a clear takeaway. Short lines (one or two sentences each). Line 1 is a HOOK (a surprising fact or bold opinion, max 14 words). The last line thanks the audience and asks them to follow.
-Performance tags (optional, before the word they apply to): ${[...EMO_TAGS, 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'shrug', 'hands_up', 'hand_chest', 'think', 'turn_left', 'turn_right', 'side_left', 'side_right', 'turn_around', 'face_front'].map((t) => `[${t}]`).join(' ')}.
+The hosts talk TO EACH OTHER, never to the camera: they react to what the other just said, ask each other questions and answer them. Only line 1 (welcome) and the last line (thanks / follow) may address the viewers. Stay strictly on the TOPIC above.
+Performance tags go before the word they apply to: start most lines with one emotion tag and put a gesture on about every second line: ${[...EMO_TAGS, 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'shrug', 'hands_up', 'hand_chest', 'think'].map((t) => `[${t}]`).join(' ')}. Do NOT write turn / look / face tags: the hosts turn their heads toward each other automatically.
 ${CFG.performanceNotes ? `WHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}\n` : ''}LENGTH: ${n}.
 ${foreign
   ? `Return ONLY JSON: {"title": "catchy episode title in ${lang!.name} (max 60 chars)", "title_en": "the same title in English", "description": "2-3 sentences for YouTube, in English", "hashtags": ["5-8 specific hashtags without #"], "lines": [{"host": 1, "text": "[excited] the line in ${lang!.name}", "en": "the English translation"}]}`
@@ -450,34 +589,15 @@ ${foreign
     if (foreign && j.lines.filter((l: any) => clean(l.en)).length < j.lines.length * 0.8) return 'missing English translations';
     return null;
   }, 'podcast_script');
-  const manualLines = manualPodcastScript ? (() => {
-    const hostNames = hosts.map((h) => h.name.toLowerCase());
-    const rawLines = manualPodcastScript.replace(/\r/g, '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    const out: { host: number; text: string; en?: string }[] = [];
-    let lastHost = 0;
-    const addText = (raw: string, forcedHost?: number) => {
-      // Split long paragraphs into short lines so captions and TTS remain readable.
-      const parts = raw.match(/[^.!?]+[.!?]?/g) || [raw];
-      for (const part of parts) {
-        const sentence = clean(part, 800); if (!sentence) continue;
-        const chunks = sentence.length > 360 ? sentence.match(/.{1,300}(?:\s|$)/g) || [sentence] : [sentence];
-        for (const chunk of chunks) { const text = clean(chunk, 360); if (!text) continue; const host = forcedHost ?? (lastHost % hosts.length); out.push({ host: host + 1, text, en: text }); lastHost = (host + 1) % hosts.length; }
-      }
-    };
-    for (const line of rawLines) {
-      const m = line.match(/^\s*(?:\[?([a-zA-Z][\w .'-]{0,24})\]?|(?:host|speaker)\s*(\d+))\s*:\s*(.+)$/i);
-      if (m) {
-        let hostIndex = -1;
-        const label = String(m[1] || '').trim().toLowerCase();
-        if (m[2]) hostIndex = Math.max(0, Math.min(hosts.length - 1, Number(m[2]) - 1));
-        else if (/^(host|speaker)\s*\d+$/.test(label)) hostIndex = Math.max(0, Math.min(hosts.length - 1, Number(label.match(/\d+/)?.[0] || 1) - 1));
-        else hostIndex = hostNames.findIndex((n) => n === label || n.startsWith(label));
-        addText(m[3], hostIndex >= 0 ? hostIndex : undefined);
-      } else addText(line);
-    }
-    return out.slice(0, 120);
-  })() : null;
-  const script = manualPodcastScript ? { title: clean((manualPodcastScript.split(/\n/).find((x) => x.trim()) || 'Podcast episode').replace(/^.*?:\s*/, ''), 70), description: `Creator-written episode of ${studio.showName}.`, hashtags: ['podcast', 'originalscript'], lines: manualLines || [] } : got?.j || {
+  const manualParsed = manualPodcastScript ? parseManualScript(manualPodcastScript, hosts.map((h) => h.name)) : null;
+  const manualLines = manualParsed ? manualParsed.lines : null;
+  if (manualParsed) {
+    const spokenWords = manualParsed.lines.reduce((n, l) => n + l.text.replace(/\[[^\]]*\]/g, ' ').split(/\s+/).filter(Boolean).length, 0);
+    kit.log(`Your script is used word for word: ${manualParsed.lines.length} lines, ${spokenWords} words, no AI rewriting.`);
+    if (manualParsed.removed.length) kit.log(`Not spoken (speaker labels / stage directions): ${manualParsed.removed.slice(0, 12).join(' | ')}${manualParsed.removed.length > 12 ? ' …' : ''}`);
+    if (manualParsed.truncated) kit.log('⚠️ The script is longer than 200 lines — the rest was left out.');
+  }
+  const script = manualPodcastScript ? { title: clean(manualParsed?.title || CFG.topic || (manualPodcastScript.split(/\n/).find((x) => x.trim()) || 'Podcast episode').replace(/^[^:]{1,24}:\s*/, ''), 70), description: `Creator-written episode of ${studio.showName}.`, hashtags: ['podcast', 'originalscript'], lines: manualLines || [] } : got?.j || {
     title: singerMode ? `${star.name}: the stories behind the songs` : `${topic}: what everyone is missing`, description: singerMode ? `${star.name} joins ${studio.showName} to talk about ${topic}.` : `The hosts of ${studio.showName} talk about ${topic}.`, hashtags: singerMode ? ['podcast', 'music', 'interview'] : ['podcast', 'talk'],
     lines: [
       ...(singerMode ? [
@@ -512,7 +632,15 @@ ${foreign
   if ((guestMode || singerMode) && ownVoice) used.add(ownVoice);
   const voices = hosts.map((h, i) => (i === 0 && guestMode && ownVoice ? ownVoice : singerMode && i === hosts.length - 1 && ownVoice ? ownVoice : voiceOf(h.gender, i)));
   if (lang) kit.log(`Podcast language: ${lang.name}${foreign ? ' with English subtitles' : ''} — voices ${voices.join(', ')}.`);
-  const lines = script.lines.map((l: any, i: number) => ({ host: clamp(Math.round(Number(l.host)), 1, hosts.length) - 1, ...parseTags(clean(l.text, 400)), en: clean(String(l.en || '').replace(/\[[^\]]*\]/g, ' '), 300), i })).filter((l: any) => l.text);
+  const autoDirect = CFG.autoDirect !== false;
+  const total = script.lines.length;
+  const lines = script.lines.map((l: any, i: number) => {
+    const directed = autoDirect ? directLine(clean(l.text, 400), { first: i === 0, last: i === total - 1 }) : clean(l.text, 400);
+    const parsed = parseTags(directed);
+    // The hosts face each other, so tags that turn a host to the camera or away are never used in a podcast.
+    return { host: clamp(Math.round(Number(l.host)), 1, hosts.length) - 1, text: parsed.text, tags: parsed.tags.filter((tg) => tg.tag !== 'face_front' && tg.tag !== 'turn_around' && tg.tag !== 'look_down'), en: clean(String(l.en || '').replace(/\[[^\]]*\]/g, ' '), 300), i };
+  }).filter((l: any) => l.text);
+  if (autoDirect) kit.log(`Director: ${lines.reduce((n: number, l: any) => n + l.tags.length, 0)} performance cues placed over ${lines.length} lines (nods, emotions, hand gestures); hosts turn toward each other automatically.`);
   const clips = await pool(lines, 4, (l: any) => speak(kit, l.text, voices[l.host], '+4%', hosts[l.host].gender, `p${l.i}`));
   // Natural pacing: quick exchanges, a beat longer on a change of speaker.
   let t = 0.5;
