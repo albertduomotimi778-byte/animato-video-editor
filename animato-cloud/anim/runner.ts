@@ -115,11 +115,30 @@ function parseTags(raw: string): { text: string; tags: { word: number; tag: stri
   return { text: words.join(' ').replace(/[*_#`>~]/g, '').trim(), tags };
 }
 
+/** Emojis are never spoken: the voice engine would read their NAMES aloud ("face with tears of joy"). */
+const EMOJI_RE = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\uFE0E\uFE0F\u200D\u20E3]+/gu;
+const EMOJI_TAGS: [RegExp, string][] = [
+  [/[😂🤣😆😹]/u, 'laugh'], [/[😢😭🥲😞😔💔]/u, 'sad'], [/[😍🥰😘❤💕💖💗💞😊😁😄🥳🎉🙏✨]/u, 'happy'], [/[😮😲😯🤯]/u, 'surprised'],
+  [/[😡🤬😠]/u, 'angry'], [/[😱😨😰]/u, 'scared'], [/[🤔🧐]/u, 'think'], [/[👍👏🙌💯]/u, 'nod'], [/[🤷]/u, 'shrug'],
+];
+/** An emoji becomes the matching performance tag (😂 → [laugh]); every other symbol is simply dropped. */
+function emojiToTags(raw: string): string {
+  const s = String(raw || '');
+  if (!EMOJI_RE.test(s)) return s;
+  EMOJI_RE.lastIndex = 0;
+  const tags: string[] = [];
+  for (const m of s.match(EMOJI_RE) || []) for (const [re, tag] of EMOJI_TAGS) if (re.test(m) && !tags.includes(tag)) { tags.push(tag); break; }
+  const text = s.replace(EMOJI_RE, ' ').replace(/[ \t]+/g, ' ').trim();
+  return (tags.slice(0, 1).map((t) => `[${t}] `).join('') + text).trim();
+}
+const stripEmoji = (s: string) => String(s || '').replace(EMOJI_RE, ' ').replace(/[ \t]+/g, ' ').trim();
+
 interface Clip { file: string; duration: number; words: Word[] }
 
 /** One line, one voice → a 48 kHz mono WAV + word timings (Edge TTS; flite offline). */
 async function speak(kit: Kit, text: string, voice: string, rate: string, gender: 'female' | 'male', id: string): Promise<Clip> {
   const base = path.join(kit.WORK_DIR, `line_${id}`);
+  text = stripEmoji(text) || text;
   fs.writeFileSync(`${base}.txt`, text);
   const wav = `${base}.wav`;
   if (!kit.CFG.offline) {
@@ -635,7 +654,8 @@ ${foreign
   const autoDirect = CFG.autoDirect !== false;
   const total = script.lines.length;
   const lines = script.lines.map((l: any, i: number) => {
-    const directed = autoDirect ? directLine(clean(l.text, 400), { first: i === 0, last: i === total - 1 }) : clean(l.text, 400);
+    const said = emojiToTags(clean(l.text, 400));
+    const directed = autoDirect ? directLine(said, { first: i === 0, last: i === total - 1 }) : said;
     const parsed = parseTags(directed);
     // The hosts face each other, so tags that turn a host to the camera or away are never used in a podcast.
     return { host: clamp(Math.round(Number(l.host)), 1, hosts.length) - 1, text: parsed.text, tags: parsed.tags.filter((tg) => tg.tag !== 'face_front' && tg.tag !== 'turn_around' && tg.tag !== 'look_down'), en: clean(String(l.en || '').replace(/\[[^\]]*\]/g, ' '), 300), i };
