@@ -257,7 +257,8 @@ let SOCIAL: Record<string, any> = {};
 // Studio animations on the Free plan render at 720p: about twice as fast, still sharp on a phone.
 const [W, H] = STUDIO?.fast ? (DIMENSIONS[CFG.aspect].map((v) => Math.round((v * 2) / 3 / 2) * 2) as [number, number]) : DIMENSIONS[CFG.aspect];
 const FRAME_W = W, FRAME_H = H;
-const FPS = 30;
+// Creative Studio videos (music videos, podcasts) are made at 24 frames a second: 20% fewer frames to draw, the same look on a phone.
+const FPS = STUDIO ? 24 : 30;
 /** Minutes left before GitHub stops the job (JOB_TIMEOUT_MINUTES, default 60, minus setup time already used). */
 const PROCESS_T0 = Date.now();
 const jobMinutesLeft = () => (parseInt(process.env.JOB_TIMEOUT_MINUTES || '60', 10) || 60) - 3 - (Date.now() - PROCESS_T0) / 60000;
@@ -2773,8 +2774,10 @@ async function renderWithStage(opts: {
   const audioExt = path.extname(opts.narration.audioPath) || '.mp3';
   const accent = CFG.category === 'cooking' ? '#FFB020' : CFG.category === 'tech' ? '#22D3EE' : CFG.category === 'news' ? '#FF4D4D' : '#FFD23F';
   // Musicals (a full concert, every frame) render at 75% size and are upscaled — about twice as fast.
-  const fast = !!opts.musicalStage && !opts.size && W * H > 1280 * 720;
-  const drawSize = fast ? { w: Math.round(W * 0.75 / 2) * 2, h: Math.round(H * 0.75 / 2) * 2 } : opts.size;
+  // Studio videos are drawn at 60-75% size and upscaled: far fewer pixels to draw and move for every frame.
+  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 0.75;
+  const fast = !!opts.musicalStage && !opts.size && (!!STUDIO || W * H > 1280 * 720);
+  const drawSize = fast ? { w: Math.round(W * drawScale / 2) * 2, h: Math.round(H * drawScale / 2) * 2 } : opts.size;
   const RW = drawSize?.w || W, RH = drawSize?.h || H;
   const job = {
     width: RW, height: RH, fps: FPS, duration: opts.duration, category: CFG.category,
@@ -4402,30 +4405,41 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
 /** Hand the finished video to the app in pieces (the app keeps it for 24 hours; the device keeps a copy). */
 async function studioDeliver(S: StudioJob, meta: { title: string; durationSec: number }) {
   const size = fs.statSync(OUTPUT_VIDEO).size;
-  const start = await appRequest('POST', `/api/animate/runner/${S.id}/upload`, { size }, 30000);
-  if (!start || start.status >= 300 || !start.data?.upload) throw new PipelineError('upload_failed', `The finished video could not be handed over (${start ? `HTTP ${start.status} ${start.data?.error || ''}` : 'app unreachable'}).`);
-  const up = start.data.upload, chunk = Number(up.chunkSize) || 6 * 1024 * 1024;
-  const n = Math.max(1, Math.ceil(size / chunk));
-  const etags: string[] = new Array(n).fill('');
-  const fd = fs.openSync(OUTPUT_VIDEO, 'r');
-  try {
-    for (let i = 0; i < n; i++) {
-      const len = Math.min(chunk, size - i * chunk);
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, i * chunk);
-      for (let a = 0; a < 5 && !etags[i]; a++) {
-        try {
-          const res = await fetch(`${CFG.appUrl}${up.base}/${i}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Animato-Runner-Key': CFG.runnerKey || '' }, body: buf, signal: AbortSignal.timeout(120000) });
-          const j: any = await res.json().catch(() => ({}));
-          if (res.ok && j.etag) etags[i] = String(j.etag); else await sleep(2000 * (a + 1));
-        } catch { await sleep(2000 * (a + 1)); }
+  let lastErr = '';
+  // The whole hand-over is retried (a fresh upload each time) so one bad moment on the app side does not lose a finished video.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { log(`⚠️ Delivery attempt ${attempt} failed (${lastErr}); starting the upload again…`); await sleep(3000 * attempt); }
+    const start = await appRequest('POST', `/api/animate/runner/${S.id}/upload`, { size }, 30000);
+    if (!start || start.status >= 300 || !start.data?.upload) { lastErr = `start: ${start ? `HTTP ${start.status} ${start.data?.error || ''}` : 'app unreachable'}`; continue; }
+    const up = start.data.upload, chunk = Number(up.chunkSize) || 6 * 1024 * 1024;
+    const n = Math.max(1, Math.ceil(size / chunk));
+    const etags: string[] = new Array(n).fill('');
+    const fd = fs.openSync(OUTPUT_VIDEO, 'r');
+    let failed = false;
+    try {
+      for (let i = 0; i < n && !failed; i++) {
+        const len = Math.min(chunk, size - i * chunk);
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, i * chunk);
+        let why = '';
+        for (let a = 0; a < 4 && !etags[i]; a++) {
+          try {
+            const res = await fetch(`${CFG.appUrl}${up.base}/${i}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Animato-Runner-Key': CFG.runnerKey || '' }, body: buf, signal: AbortSignal.timeout(120000) });
+            const j: any = await res.json().catch(() => ({}));
+            if (res.ok && j.etag) etags[i] = String(j.etag);
+            else { why = `HTTP ${res.status} ${j?.error || ''}`.trim(); if (res.status === 409) break; /* the app lost the upload record: start over */ await sleep(2000 * (a + 1)); }
+          } catch (e: any) { why = String(e?.message || e); await sleep(2000 * (a + 1)); }
+        }
+        if (!etags[i]) { lastErr = `piece ${i + 1}/${n}: ${why || 'no answer'}`; failed = true; break; }
+        await reportStatus('running', 'Delivering your animation', Math.min(99, 92 + Math.round((7 * (i + 1)) / n)), `Sent ${i + 1}/${n}.`);
       }
-      if (!etags[i]) throw new PipelineError('upload_failed', `Piece ${i + 1} of the video could not be sent.`);
-      await reportStatus('running', 'Delivering your animation', Math.min(99, 92 + Math.round((7 * (i + 1)) / n)), `Sent ${i + 1}/${n}.`);
-    }
-  } finally { fs.closeSync(fd); }
-  const done = await appRequest('POST', `/api/animate/runner/${S.id}/complete`, { parts: etags, size, width: W, height: H, ...meta }, 60000);
-  if (!done || done.status >= 300) throw new PipelineError('upload_failed', `The video could not be saved (${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}).`);
+    } finally { fs.closeSync(fd); }
+    if (failed) continue;
+    const done = await appRequest('POST', `/api/animate/runner/${S.id}/complete`, { parts: etags, size, width: W, height: H, ...meta }, 60000);
+    if (done && done.status < 300) return;
+    lastErr = `complete: ${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}`;
+  }
+  throw new PipelineError('upload_failed', `The finished video could not be delivered (${lastErr}).`);
 }
 
 async function applyStudioMusic(S: StudioJob, durationSec: number): Promise<void> {
@@ -4598,15 +4612,18 @@ async function studioWatermark() {
 function animKit() {
   const landscapePodcast = CFG.category === 'podcast' && H >= W;
   const RW = landscapePodcast ? 1920 : W, RH = landscapePodcast ? 1080 : H;
+  // Studio podcasts are drawn smaller and upscaled to the final frame (much faster, still sharp on a phone).
+  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 1;
+  const DW = STUDIO ? Math.round(RW * drawScale / 2) * 2 : RW, DH = STUDIO ? Math.round(RH * drawScale / 2) * 2 : RH;
   return {
     hostVoice: '',
-    CFG, W: RW, H: RH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
+    CFG, W: DW, H: DH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
     run: (cmd: string, args: string[], o: { timeoutMs?: number } = {}) => run(cmd, args, o),
     probeDuration, pastTitles: [] as string[], PipelineError,
     composeMusic: (mood: string, seconds: number, seed: string) => composeBuffers(mood as any, Math.max(10, seconds), seed),
     automateLevel, eqForVoice,
     runStage: (o: { stageFile: string; job: any; audioFinal: string; files: Record<string, string>; duration: number }) => runStage({
-      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: RW, h: RH },
+      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: DW, h: DH }, ...(STUDIO ? { scaleTo: { w: RW, h: RH } } : {}),
       audio: { inputs: ['-i', o.audioFinal], filter: '[1:a]aresample=48000,apad[aout]' }
     })
   };
