@@ -71,15 +71,17 @@ const DEFAULT_YT_CLIENT_ID = '592242596648-am9pri2j11vmu44fdc6oau5p34aklkj8.apps
 // API keys are never stored in the render repository: the app sends them in
 // every dispatch (auth.*), or they come from repository secrets.
 
-const DIMENSIONS: Record<string, [number, number]> = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080], '4:3': [1440, 1080] };
+const DIMENSIONS: Record<string, [number, number]> = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080], '4:3': [1440, 1080], '4:5': [1080, 1350] };
 
 function resolveFormat(): { format: 'shorts' | 'video'; aspect: string } {
   const rawAspect = pick(JOB.aspect_ratio, INPUTS.aspect_ratio, ENV.ASPECT_RATIO, '9:16').replace('/', ':');
   let aspect = DIMENSIONS[rawAspect] ? rawAspect : '9:16';
   const rawFormat = pick(JOB.format, INPUTS.format, ENV.VIDEO_FORMAT).toLowerCase();
   const format: 'shorts' | 'video' = rawFormat === 'video' ? 'video' : rawFormat === 'shorts' ? 'shorts' : (aspect === '16:9' || aspect === '4:3' ? 'video' : 'shorts');
+  // A one-off music video or podcast from the app: the person chose the frame (TikTok 9:16, Instagram 4:5, YouTube 16:9) — use it as it is.
+  if (pick(JOB.studio_job, INPUTS.studio_job)) return { format, aspect };
   if (format === 'shorts' && (aspect === '16:9' || aspect === '4:3')) aspect = '9:16';
-  if (format === 'video' && (aspect === '9:16' || aspect === '1:1')) aspect = '16:9';
+  if (format === 'video' && (aspect === '9:16' || aspect === '1:1' || aspect === '4:5')) aspect = '16:9';
   return { format, aspect };
 }
 
@@ -4467,7 +4469,8 @@ async function produceStudio(t0: number): Promise<number> {
 
   // ---- One-off music video from Tools (never an automation episode) ----
   if (S.kind === 'musical') {
-    CFG.category = 'musical'; CFG.format = 'shorts'; CFG.aspect = '9:16';
+    // The frame (9:16, 4:5 or 16:9) was chosen in the app and is already applied; the song stays a short one.
+    CFG.category = 'musical'; CFG.format = 'shorts';
     CFG.musicalLyrics = String(S.script || '').slice(0, 3000);
     CFG.musicLanguage = S.musicLanguage || 'English'; CFG.subGenre = S.subGenre || 'afrobeats';
     CFG.stageId = S.stageMode === 'fixed' ? (S.stageId || 0) : 0;
@@ -4480,7 +4483,7 @@ async function produceStudio(t0: number): Promise<number> {
 
   // ---- One-off podcast from Tools (never an automation episode) ----
   if (S.kind === 'podcast') {
-    CFG.category = 'podcast'; CFG.format = 'video'; CFG.aspect = '16:9';
+    CFG.category = 'podcast'; CFG.format = CFG.aspect === '16:9' ? 'video' : 'shorts';
     CFG.podcastScript = String(S.script || '').slice(0, 8000);
     CFG.castSpecs = Array.isArray(S.podcastHosts) && S.podcastHosts.length ? S.podcastHosts : S.cast.map((c) => c.spec).filter(Boolean);
     CFG.studio = S.podcastStudio || CFG.studio;
@@ -4610,7 +4613,8 @@ async function studioWatermark() {
 
 /** The toolkit the 2D animation engine needs (shared by automations and Studio animations). */
 function animKit() {
-  const landscapePodcast = CFG.category === 'podcast' && H >= W;
+  // Automation podcasts are filmed landscape and placed in a vertical frame; a one-off podcast is drawn in the frame the person chose.
+  const landscapePodcast = CFG.category === 'podcast' && H >= W && !STUDIO;
   const RW = landscapePodcast ? 1920 : W, RH = landscapePodcast ? 1080 : H;
   // Studio podcasts are drawn smaller and upscaled to the final frame (much faster, still sharp on a phone).
   const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 1;
