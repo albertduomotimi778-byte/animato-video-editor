@@ -3606,7 +3606,7 @@ async function writeMusicalSong(pastTitles: string[]): Promise<MusicalSong> {
     const repeated: MusicalSection[] = arranged.flatMap((s) => s.tag === 'chorus' ? [s, { ...s, emotion: s.emotion || 'excited' }] : [s]);
     const lyrics = cleanMusicLyrics(sectionLyricText(repeated));
     const firstLine = lines.find((x) => x && !/^\[/.test(x)) || 'Original song';
-    const title = clean(firstLine.replace(/^[^:]{1,24}:\s*/, '').replace(/[.!?].*$/, ''), 70) || 'Original song';
+    const title = String(firstLine.replace(/^[^:]{1,24}:\s*/, '').replace(/[.!?].*$/, '')).replace(/\s+/g, ' ').trim().slice(0, 70) || 'Original song';
     const gender = CFG.gender === 'male' ? 'male' : 'female';
     const style = String(CFG.subGenre || 'original music');
     return { title, description: `Original ${style} music video performed by a ${gender} lead singer.`, lyrics, sections: repeated, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
