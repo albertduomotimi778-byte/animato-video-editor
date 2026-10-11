@@ -30,7 +30,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { LlmPool, extractJsonObject } from './llm.ts';
+import { LlmPool, extractJsonObject, createRelay, splitKeys } from './llm.ts';
 import { composeWav, type MusicMood } from './music.ts';
 
 const ENV = process.env;
@@ -56,7 +56,13 @@ const log = (m: string) => console.log(`[${new Date().toISOString().slice(11, 19
 class EditError extends Error {}
 
 // The planner is the self-hosted model started by the workflow on this runner (no API keys).
-const LLM = new LlmPool({ localUrl: ENV.LOCAL_LLM_URL || 'http://127.0.0.1:8080/v1', visionUrl: ENV.LOCAL_VLM_URL || undefined, log });
+// Hosted AI through the app server (which rotates the keys: Gemini first for editing, Groq / OpenRouter as fallbacks).
+const RELAY = createRelay({ appUrl: APP, scope: `editor:${JOB_ID}`, runnerKey: String(AUTH.runner_key || '') });
+const LLM = new LlmPool({
+  relay: RELAY.available ? (r) => RELAY.llm(r) : undefined,
+  groqKeys: splitKeys(ENV.GROQ_API_KEYS), geminiKeys: splitKeys(ENV.GEMINI_API_KEYS), openrouterKeys: splitKeys(ENV.OPENROUTER_API_KEYS),
+  log
+});
 
 let lastReport = 0;
 async function report(status: string, step: string, progress: number, logLine = '', extra: any = {}) {
@@ -82,6 +88,7 @@ function run(cmd: string, args: string[], timeoutMs = 3600_000): Promise<{ code:
     p.on('error', (e) => { clearTimeout(t); resolve({ code: -1, out, err: String(e) }); });
   });
 }
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const ff = (args: string[], timeoutMs?: number) => run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], timeoutMs);
 
 async function probe(file: string): Promise<{ duration: number; width: number; height: number; hasAudio: boolean; hasVideo: boolean; fps: number; rotation: number }> {
@@ -160,66 +167,31 @@ const bare = (x: string) => x.toLowerCase().replace(/[^a-z0-9'\u00C0-\u024F\u040
 async function transcribe(audio: string, dur: number, hint: string): Promise<W[]> {
   // Test hook (never set in production): a ready word list.
   if (ENV.EDITOR_TRANSCRIPT && fs.existsSync(ENV.EDITOR_TRANSCRIPT)) return JSON.parse(fs.readFileSync(ENV.EDITOR_TRANSCRIPT, 'utf8'));
-  // faster-whisper on this runner (CPU, int8). The workflow pre-installs it in its own cached
-  // environment (ASR_PYTHON); without that, it is installed here.
-  let py = ENV.ASR_PYTHON && fs.existsSync(ENV.ASR_PYTHON) ? ENV.ASR_PYTHON : '';
-  if (!py || (await run(py, ['-c', 'import faster_whisper'])).code !== 0) {
-    const venv = path.join(WORK, 'asr-venv');
-    log('Installing the speech-to-text engine on this runner…');
-    let r = await run('python3', ['-m', 'venv', venv], 300000);
-    py = r.code === 0 ? path.join(venv, 'bin', 'python') : 'python3';
-    r = await run(py, ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', 'faster-whisper'], 900000);
-    if (r.code !== 0) r = await run(py, ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--break-system-packages', 'faster-whisper'], 900000);
-    if ((await run(py, ['-c', 'import faster_whisper'])).code !== 0) throw new EditError(`Transcription failed: the speech-to-text engine could not be installed (${r.err.trim().split('\n').slice(-3).join(' | ').slice(0, 300)}).`);
-  }
-  const script = path.join(WORK, 'asr.py');
-  fs.writeFileSync(script, `import json,sys
-import av as _av
-_av_open=_av.open
-def _open(*a,**k):
-  k.pop("metadata_errors",None)
-  return _av_open(*a,**k)
-_av.open=_open
-def _pcm(p):
-  import subprocess,numpy as np
-  try:
-    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
-    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
-    return a if a.size>1600 else p
-  except Exception:
-    return p
-from faster_whisper import WhisperModel
-audio,model,hint,out=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
-m=WhisperModel(model,device="cpu",compute_type="int8",cpu_threads=${CPUS})
-segs,info=m.transcribe(_pcm(audio),word_timestamps=True,vad_filter=False,beam_size=1,condition_on_previous_text=False,initial_prompt=(hint or None))
-words=[]
-for s in segs:
-  for w in (s.words or []):
-    if w.word.strip(): words.append({"w":w.word.strip(),"s":round(w.start,3),"e":round(w.end,3)})
-json.dump(words,open(out,"w"))
-print("language",info.language,"words",len(words),flush=True)
-`);
-  // A 16 kHz mono WAV is what Whisper reads anyway (and avoids codec surprises).
+  // Hosted Groq Whisper (through the app server, keys rotated). Long voices are sent in pieces
+  // under the upload limit and the word times are shifted back into place.
   const wav = path.join(WORK, 'asr_in.wav');
   if ((await ff(['-i', audio, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav])).code !== 0) throw new EditError('Transcription failed: the voice track could not be read.');
-  const models = dur > 1800 ? ['base', 'tiny'] : ['small', 'base', 'tiny'];
-  let last = '';
-  for (const model of models) {
-    const out = path.join(WORK, `asr_${model}.json`);
-    const t0 = Date.now();
-    log(`Transcribing the voice on this runner (Whisper ${model})…`);
-    const r = await run(py, [script, wav, model, hint.slice(0, 220), out], 3 * 3600_000);
-    if (r.code === 0 && fs.existsSync(out)) {
-      const list: W[] = JSON.parse(fs.readFileSync(out, 'utf8') || '[]');
-      log(`Transcribed ${list.length} words in ${Math.round((Date.now() - t0) / 1000)}s (Whisper ${model}, ${r.out.trim().split('\n').pop()}).`);
-      if (list.length || model === models[models.length - 1]) return list;
-      last = 'no words were heard';
-      continue;
+  const CHUNK = 600;   // seconds per request (16 kHz mono WAV ≈ 19 MB per 10 min, under the 24 MB limit)
+  const pieces = Math.max(1, Math.ceil(dur / CHUNK));
+  const all: W[] = [];
+  const t0 = Date.now();
+  for (let i = 0; i < pieces; i++) {
+    const offset = i * CHUNK;
+    const file = pieces === 1 ? wav : path.join(WORK, `asr_${i}.wav`);
+    if (pieces > 1 && (await ff(['-ss', String(offset), '-t', String(CHUNK), '-i', wav, '-c:a', 'pcm_s16le', file])).code !== 0) throw new EditError('Transcription failed: could not split the voice track.');
+    const bytes = new Uint8Array(fs.readFileSync(file));
+    let got: { text: string; words: { word: string; start: number; end: number }[] } | null = null, lastErr = '';
+    for (let attempt = 0; attempt < 3 && !got; attempt++) {
+      try {
+        if (RELAY.available) got = await RELAY.stt(bytes, 'audio/wav', { prompt: hint.slice(0, 220) });
+        else throw new Error('no app address / runner key to reach the speech service');
+      } catch (e: any) { lastErr = String(e?.message || e).slice(0, 200); log(`Speech-to-text attempt ${attempt + 1} failed (${lastErr}).`); await sleep(3000 * (attempt + 1)); }
     }
-    last = (r.err || r.out).trim().split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 400);
-    log(`Whisper ${model} failed (${last}) — trying a smaller model.`);
+    if (!got) throw new EditError(`Transcription failed: ${lastErr || 'unknown error'}`);
+    for (const w of got.words) all.push({ w: w.word, s: +(w.start + offset).toFixed(3), e: +(w.end + offset).toFixed(3) });
   }
-  throw new EditError(`Transcription failed: ${last || 'unknown error'}`);
+  log(`Transcribed ${all.length} words in ${Math.round((Date.now() - t0) / 1000)}s (Groq Whisper).`);
+  return all;
 }
 function punctuate(words: W[], segs: { text: string; s: number; e: number }[]) {
   for (const sg of segs) {

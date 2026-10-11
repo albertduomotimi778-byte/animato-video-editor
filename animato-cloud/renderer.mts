@@ -29,7 +29,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { LlmPool, extractJsonObject } from './llm.ts';
+import { LlmPool, extractJsonObject, createRelay, splitKeys } from './llm.ts';
 import { researchNews, bingNews, researchRecipe, factSheet, unsupportedNumbers, visionMatches, visionAnatomy, metadataMatches, identifierTokens, type FactPack, type ResearchCtx } from './research.ts';
 import { composeBuffers, eqForVoice, automateLevel, levelDb, encodeWav, moodFor } from './music.ts';
 import { runAnimated, ANIM_CATEGORIES } from './anim/runner.ts';
@@ -123,8 +123,6 @@ const CFG = {
   ytClientId: pick(AUTH.youtube_client_id, ENV.YOUTUBE_CLIENT_ID, DEFAULT_YT_CLIENT_ID),
   ytClientSecret: pick(AUTH.youtube_client_secret, ENV.YOUTUBE_CLIENT_SECRET),
   // The script writer is the self-hosted model started by the workflow on this runner (no API keys).
-  localLlmUrl: pick(ENV.LOCAL_LLM_URL, 'http://127.0.0.1:8080/v1'),
-  localVlmUrl: pick(ENV.LOCAL_VLM_URL),
   geminiKeys: [] as string[],
   groqKeys: [] as string[],
   airforceKey: '',
@@ -134,7 +132,7 @@ const CFG = {
   // Music engine: ACE-Step 1.5 official cloud (free API key from https://acemusic.ai/api-key).
   // Personal project: built-in ACE-Step keys (rotated); a repository secret still overrides them.
   // Set to the local ACE-Step server on the runner while a song is being made.
-  acestepBase: 'http://127.0.0.1:8011',
+  acestepBase: pick(ENV.ACESTEP_BASE_URL, 'https://api.acemusic.ai'),
   acestepModel: pick(ENV.ACESTEP_MODEL, ''),
   // Musical song length (seconds), at most 60: intro → verse → pre-chorus → chorus → chorus again → outro.
   musicSeconds: Math.max(20, Math.min(60, parseInt(pick(ENV.MUSIC_SECONDS, '60'), 10) || 60)),
@@ -204,7 +202,7 @@ const CFG = {
   maxRenderSeconds: parseInt(pick(ENV.MAX_VIDEO_SECONDS, '0'), 10) || 0,
   // Longest time a run spends waiting for ACE-Step before giving up (the next run retries).
   // Max minutes for ACE-Step on the runner (setup on the first run + making the song on the CPU).
-  acestepLocalMin: parseInt(pick(ENV.ACESTEP_LOCAL_MINUTES, '35'), 10) || 35
+  acestepLocalMin: parseInt(pick(ENV.ACESTEP_MAX_MINUTES, '6'), 10) || 6
 };
 
 /**
@@ -762,9 +760,12 @@ interface Script {
 // Script writer pool: Gemini (keys rotated per run, instant failover) → Groq.
 // An exhausted model is never retried in the same run (see llm.ts).
 // ---------------------------------------------------------------------------
+// Runners never hold the AI keys: the app server rotates them (Groq + Gemini + OpenRouter) and answers.
+// For local tests, keys in the environment (GROQ_API_KEYS …) are used directly instead.
+const RELAY = createRelay({ appUrl: CFG.appUrl, scope: STUDIO ? `animate:${STUDIO.id}` : `campaign:${CFG.campaignId}`, runnerKey: CFG.runnerKey });
 const LLM = new LlmPool({
-  localUrl: CFG.localLlmUrl,
-  visionUrl: CFG.localVlmUrl || undefined,
+  relay: RELAY.available ? (r) => RELAY.llm(r) : undefined,
+  groqKeys: splitKeys(ENV.GROQ_API_KEYS), geminiKeys: splitKeys(ENV.GEMINI_API_KEYS), openrouterKeys: splitKeys(ENV.OPENROUTER_API_KEYS),
   log: (m) => log(m),
   seed: parseInt(crypto.createHash('md5').update(`${CFG.campaignId}:${CFG.partNumber}:${CFG.runId}`).digest('hex').slice(0, 6), 16)
 });
@@ -1362,9 +1363,9 @@ async function generateScript(pastStory: string, pastTitles: string[], pastSourc
     else if (sc.sourceHeadline) sc.sourceStory = { title: sc.sourceHeadline, source: '', link: '' };
     return sc;
   };
-  if (!CFG.offline && !LLM.hasKeys) throw new PipelineError('script_failed', 'The AI model on the runner did not start.');
+  if (!CFG.offline && !LLM.hasKeys) throw new PipelineError('script_failed', 'No AI service is reachable: the runner has no app address / runner key and no AI keys.');
   if (!CFG.offline) {
-    log(`Script writer: the self-hosted model on this runner (${CFG.localLlmUrl}).`);
+    log('Script writer: hosted AI (rotating Groq / Gemini / OpenRouter keys).');
     const t0 = Date.now();
     for await (const a of LLM.attempts({
       system,
@@ -1798,29 +1799,29 @@ function startImageGenerator(): Promise<boolean> {
   return imagegenReady;
 }
 
-/** Draws one picture with the local generator. Returns 'ai-clean' (never watermarked) or null. */
-async function aiImage(prompt: string, seed: number, file: string, style = '', mode = ''): Promise<'ai' | 'ai-clean' | null> {
-  if (CFG.offline || !prompt || imagegenDisabled) return null;
-  if (!(await startImageGenerator())) return null;
+/** Draws one picture with Pollinations (free, hosted) — only used when no real picture was found. Returns 'ai-clean' or null. */
+async function aiImage(prompt: string, seed: number, file: string, style = '', _mode = ''): Promise<'ai' | 'ai-clean' | null> {
+  if (CFG.offline || !prompt) return null;
   const size = orientation === 'portrait' ? { w: 864, h: 1536 } : orientation === 'landscape' ? { w: 1536, h: 864 } : { w: 1152, h: 1152 };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (imagegenDisabled) return null;
-    try {
-      const res = await fetch(`${IMAGEGEN_BASE}/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: prompt.slice(0, 1200), style, mode, seed: seed % 4294967295, width: size.w, height: size.h, out: file }),
-        signal: AbortSignal.timeout(240000)
-      });
-      const data: any = await res.json().catch(() => ({}));
-      if (res.ok && data?.ok && fs.existsSync(file)) { imagegenCount++; imagegenStreak = 0; return 'ai-clean'; }
-      log(`Image generator: HTTP ${res.status} ${String(data?.error || '').slice(0, 160)}`);
-      if (res.status === 503) await sleep(2000);
-    } catch (err: any) {
-      log(`Image generator request failed (${err?.message}).`);
+  const full = `${prompt}${style ? `, ${style}` : ''}`.slice(0, 900);
+  const q = `prompt=${encodeURIComponent(full)}&w=${size.w}&h=${size.h}&seed=${seed % 1000000}`;
+  const urls = [
+    ...(RELAY.available ? [{ url: `${CFG.appUrl}/api/ai/relay/image?${q}`, headers: { 'X-Animato-Runner-Key': CFG.runnerKey, 'X-Animato-Scope': STUDIO ? `animate:${STUDIO.id}` : `campaign:${CFG.campaignId}` } as Record<string, string> }] : []),
+    { url: `https://image.pollinations.ai/prompt/${encodeURIComponent(full)}?width=${size.w}&height=${size.h}&seed=${seed % 1000000}&model=flux&nologo=true`, headers: {} as Record<string, string> }
+  ];
+  for (const u of urls) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(u.url, { headers: u.headers, signal: AbortSignal.timeout(80000) });
+        if (res.ok && /^image\//.test(res.headers.get('content-type') || '')) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          if (buf.length > 4000) { fs.writeFileSync(file, buf); return 'ai-clean'; }
+        }
+        log(`Pollinations: HTTP ${res.status}`);
+        if (res.status === 429) await sleep(4000);
+      } catch (err: any) { log(`Pollinations request failed (${err?.message}).`); }
     }
   }
-  if (++imagegenStreak >= 3) { imagegenDisabled = 'it failed 3 times in a row'; log('⚠️ Image generator disabled for the rest of this run (it failed 3 times in a row).'); }
   return null;
 }
 
@@ -3671,111 +3672,35 @@ const mmss = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms 
 /** Shows what ACE-Step is doing on the automation card, so a slow song never looks frozen. */
 async function aceStatus(what: string) {
   const el = Date.now() - aceStarted;
-  try { await reportStatus('running', `2/6 Generating music (ACE-Step on the runner) · ${mmss(el)} of max ${CFG.acestepLocalMin}:00`, Math.min(40, 24 + Math.round((el / (CFG.acestepLocalMin * 60000)) * 16)), `🎵 ${what} (${mmss(el)} elapsed)`); } catch {}
+  try { await reportStatus('running', `2/6 Generating music (ACE Music cloud) · ${mmss(el)}`, Math.min(40, 24 + Math.round((el / (CFG.acestepLocalMin * 60000)) * 16)), `🎵 ${what} (${mmss(el)} elapsed)`); } catch {}
 }
 const aceLeft = () => Math.max(0, aceDeadline - Date.now());
-/**
- * ACE-Step everywhere: the hosted API first; when it is down / overloaded (Cloudflare 504s), the SAME
- * open-source model runs on the GitHub runner's CPU (installed in the background while the hosted API
- * is tried, and cached between runs), through ACE-Step's own REST server (/release_task → /query_result).
- */
-let aceLocalRun = false;
-/** ACE-Step runs ONLY on the GitHub runner (no online API): installed once, cached between runs. */
+/** ACE Music cloud (api.acemusic.ai), keys rotated: a key that is rate-limited, out of quota or invalid is skipped. */
+async function aceKeys(): Promise<string[]> {
+  const local = splitKeys(ENV.ACE_MUSIC_API_KEYS);
+  if (local.length) return local;
+  if (RELAY.available) return RELAY.musicKeys();
+  return [];
+}
 async function generateAceStepMusic(song: MusicalSong): Promise<{ file: string; duration: number; taskId?: string }> {
-  return aceLocalGenerate(song, prepareLocalAce());
-}
-let aceLocalPrep: Promise<{ base: string; stop: () => void; lm: boolean }> | null = null;
-let aceLocalWantLm = true;
-/** The local server's own key (sent as both the Bearer header and ai_token, which it checks). */
-const ACE_LOCAL_KEY = `animato-${crypto.randomBytes(8).toString('hex')}`;
-function prepareLocalAce(): Promise<{ base: string; stop: () => void; lm: boolean }> {
-  if (aceLocalPrep) return aceLocalPrep;
-  aceLocalPrep = (async () => {
-    const t0 = Date.now();
-    const root = path.join(os.homedir(), 'acestep-local'), repo = path.join(root, 'repo'), venv = path.join(root, 'venv'), py = path.join(venv, 'bin', 'python');
-    const ckpt = path.join(repo, 'checkpoints');
-    const script = `set -e
-mkdir -p "${root}"
-if [ ! -d "${repo}/acestep" ]; then git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git "${repo}"; fi
-if [ ! -x "${py}" ]; then python3 -m venv "${venv}"; fi
-if ! "${py}" -c "import acestep, torch, diffusers, transformers" 2>/dev/null; then
-  "${py}" -m pip install -q --disable-pip-version-check --upgrade pip
-  "${py}" -m pip install -q --disable-pip-version-check torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-  "${py}" -m pip install -q --disable-pip-version-check "transformers>=4.51.0,<4.58.0" "diffusers>=0.37.0" "matplotlib>=3.7.5" "scipy>=1.10.1" "soundfile>=0.13.1" "loguru>=0.7.3" "einops>=0.8.1" "accelerate>=1.12.0" "fastapi>=0.110.0" diskcache "uvicorn[standard]>=0.27.0" "numba>=0.63.1" "vector-quantize-pytorch>=1.27.15" "torchao>=0.16.0,<0.17.0" toml "peft>=0.18.0" lycoris-lora modelscope "typer-slim>=0.21.1" "pytorch-wavelets>=1.3.0" "pywavelets>=1.9.0" "setuptools<72" huggingface_hub "gradio==6.2.0" "lightning>=2.0.0" "tensorboard>=2.20.0"
-  "${py}" -m pip install -q --disable-pip-version-check --no-deps -e "${repo}"
-fi
-# Only what text-to-music needs (turbo DiT, VAE, text encoder) — not the 1.7B planning LM.
-if [ ! -d "${ckpt}/acestep-v15-turbo" ] || [ ! -d "${ckpt}/vae" ] || [ ! -d "${ckpt}/Qwen3-Embedding-0.6B" ]; then
-  "${py}" -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/Ace-Step1.5', local_dir='${ckpt}', allow_patterns=['acestep-v15-turbo/*','vae/*','Qwen3-Embedding-0.6B/*','*.json','*.txt'])"
-fi
-# The small planning LM ("thinking": plans the song's sections and melody before the music is made).
-if [ ! -d "${ckpt}/acestep-5Hz-lm-0.6B" ]; then
-  "${py}" -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-5Hz-lm-0.6B', local_dir='${ckpt}/acestep-5Hz-lm-0.6B')" || echo "LM download failed (songs will be made without planning)"
-fi
-du -sh "${root}" 2>/dev/null || true
-`;
-    const scriptFile = path.join(WORK_DIR, 'acestep_local_setup.sh');
-    fs.writeFileSync(scriptFile, script);
-    log('🎵 Preparing ACE-Step on this runner (background; cached after the first run)…');
-    const r = await run('bash', [scriptFile], { timeoutMs: 22 * 60000 });
-    if (r.code !== 0) throw new Error(`local ACE-Step setup failed: ${r.stderr.split('\n').filter(Boolean).slice(-4).join(' | ').slice(0, 400)}`);
-    log(`🎵 Local ACE-Step installed in ${((Date.now() - t0) / 1000).toFixed(0)}s (${r.stdout.toString().trim().split('\n').pop() || ''}).`);
-    const useLm = aceLocalWantLm && fs.existsSync(path.join(ckpt, 'acestep-5Hz-lm-0.6B'));
-    const port = 8011, threads = String(Math.max(1, os.cpus().length));
-    const env = { ...process.env, ACESTEP_API_HOST: '127.0.0.1', ACESTEP_API_PORT: String(port), ACESTEP_API_KEY: ACE_LOCAL_KEY, ACESTEP_DEVICE: 'cpu', ACESTEP_INIT_LLM: useLm ? 'true' : 'false', ACESTEP_LM_BACKEND: 'pt', ACESTEP_LM_MODEL_PATH: 'acestep-5Hz-lm-0.6B', ACESTEP_LM_DEVICE: 'cpu',
-      ACESTEP_USE_FLASH_ATTENTION: 'false', ACESTEP_CONFIG_PATH: 'acestep-v15-turbo', ACESTEP_PROJECT_ROOT: repo, ACESTEP_CHECKPOINTS_DIR: ckpt, OMP_NUM_THREADS: threads, MKL_NUM_THREADS: threads, TOKENIZERS_PARALLELISM: 'false',
-      // ACE-Step stops a generation after 600 s by default (a GPU figure); CPUs need longer.
-      ACESTEP_GENERATION_TIMEOUT: '3600' };
-    const srv = spawn(py, ['-m', 'acestep.api_server'], { cwd: repo, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let tail = '';
-    const keep = (d: Buffer) => { tail = (tail + d.toString()).slice(-4000); };
-    srv.stdout.on('data', keep); srv.stderr.on('data', keep);
-    let exited = false; srv.on('close', () => { exited = true; });
-    const base = `http://127.0.0.1:${port}`;
-    const until = Date.now() + 12 * 60000;
-    while (Date.now() < until) {
-      if (exited) throw new Error(`local ACE-Step server stopped: ${tail.split('\n').filter(Boolean).slice(-4).join(' | ').slice(0, 400)}`);
-      try { const h = await fetch(`${base}/health`, { signal: AbortSignal.timeout(5000) }); if (h.ok) break; } catch {}
-      await sleep(3000);
-    }
-    if (Date.now() >= until) { try { srv.kill('SIGKILL'); } catch {} throw new Error('local ACE-Step server did not start within 12 min'); }
-    log(`🎵 Local ACE-Step server ready in ${((Date.now() - t0) / 1000).toFixed(0)}s${useLm ? ' (with the song-planning model)' : ''}.`);
-    return { base, lm: useLm, stop: () => { try { srv.kill('SIGKILL'); } catch {} aceLocalPrep = null; } };
-  })();
-  return aceLocalPrep;
-}
-async function aceLocalGenerate(song: MusicalSong, prep: Promise<{ base: string; stop: () => void; lm: boolean }>): Promise<{ file: string; duration: number; taskId?: string }> {
   aceStarted = Date.now();
   aceDeadline = aceStarted + CFG.acestepLocalMin * 60000;
-  const once = async (p: Promise<{ base: string; stop: () => void; lm: boolean }>) => {
-    await aceStatus('setting up ACE-Step on the runner (CPU)');
-    const beat = setInterval(() => { aceStatus('ACE-Step on the runner: installing / loading the model'); }, 30000);
-    let srv: { base: string; stop: () => void; lm: boolean };
-    try { srv = await p; } finally { clearInterval(beat); }
-    const saved = CFG.acestepBase;
-    (CFG as any).acestepBase = srv.base;
-    aceLocalRun = true;
+  let keys: string[] = [];
+  try { keys = await aceKeys(); } catch (e: any) { log(`⚠️ Could not get the music keys (${e?.message || e}).`); }
+  if (!keys.length) throw new PipelineError('acestep_auth', 'No ACE Music keys are available (set ACE_MUSIC_API_KEYS on the app server).');
+  let last: any = null;
+  for (const key of keys) {
+    if (aceLeft() < 30000) break;
     try {
-      const what = `ACE-Step on the runner is ${srv.lm ? 'planning and ' : ''}making the song (CPU)`;
-      await aceStatus(what);
-      const beat2 = setInterval(() => { aceStatus(what); }, 30000);
-      try { return await aceStepNative(song, ACE_LOCAL_KEY, !srv.lm); }   // with the planning LM: thinking on
-      finally { clearInterval(beat2); }
-    } finally {
-      (CFG as any).acestepBase = saved;
-      aceLocalRun = false;
-      srv.stop();   // free the RAM for the stems + the video render
+      await aceStatus(`ACE Music cloud is composing (key …${key.slice(-4)})`);
+      return await aceStepNative(song, key, true);
+    } catch (e: any) {
+      last = e;
+      log(`⚠️ ACE key …${key.slice(-4)} failed (${String(e?.message || e).slice(0, 160)}) — trying the next key.`);
+      if (e instanceof PipelineError && !['acestep_auth', 'acestep_quota', 'acestep_busy', 'acestep_failed'].includes(e.code)) throw e;
     }
-  };
-  try { return await once(prep); }
-  catch (e: any) {
-    if (!aceLocalWantLm || aceLeft() < 5 * 60000) throw e;
-    // The planning model failed (or the server could not load it): make the song without it.
-    log(`⚠️ ACE-Step with the planning model failed (${String(e?.message || e).slice(0, 200)}) — trying again without it.`);
-    aceLocalWantLm = false;
-    aceLocalPrep = null;
-    return once(prepareLocalAce());
   }
+  throw last || new PipelineError('acestep_busy', 'Every ACE Music key is busy right now.');
 }
 /** Set on a regeneration when the first song came out in the wrong voice. */
 let aceGenderBoost = false;
@@ -3824,7 +3749,7 @@ async function saveAceAudio(buf: Buffer, label: string) {
 }
 async function aceStepNative(song: MusicalSong, apiKey: string, fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
   const r = aceStepRequest(song);
-  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8' };
+  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8', 'User-Agent': 'curl/8.7.1' };
   // "thinking" (the 5Hz planning LM) gives better songs but is slower; the retry rounds switch it off.
   const body: any = {
     prompt: r.prompt, caption: r.prompt, lyrics: r.lyrics, audio_duration: r.target, audio_format: 'mp3', batch_size: 1, vocal_language: r.lang,
@@ -3853,8 +3778,8 @@ async function aceStepNative(song: MusicalSong, apiKey: string, fast: boolean): 
   }
   log(`🎵 ACE-Step task ${taskId.slice(0, 24)} accepted${fast ? ' (fast mode)' : ''}; waiting for the song…`);
   const started = Date.now();
-  for (let attempt = 0; Date.now() - started < Math.min(aceLocalRun ? 60 * 60 * 1000 : 15 * 60 * 1000, aceLeft()); attempt++) {
-    await sleep(attempt < 6 ? 5000 : 8000);
+  for (let attempt = 0; Date.now() - started < Math.min(15 * 60 * 1000, aceLeft()); attempt++) {
+    await sleep(attempt < 15 ? 2500 : 5000);
     let q: Response;
     try { q = await fetch(`${CFG.acestepBase}/query_result`, { method: 'POST', headers, body: JSON.stringify({ task_id_list: [taskId] }), signal: AbortSignal.timeout(45000) }); }
     catch { continue; }
@@ -3910,7 +3835,7 @@ async function generateLyriaMusic(song: MusicalSong): Promise<{ file: string; du
   throw new PipelineError('lyria_failed', `Lyria music generation failed: ${lastErr || 'unknown error'}`);
 }
 
-const MUSIC_ENGINE_LABEL: Record<string, string> = { acestep: 'ACE-Step 1.5 (on the runner)', lyria: 'Google Lyria' };
+const MUSIC_ENGINE_LABEL: Record<string, string> = { acestep: 'ACE Music cloud (ACE-Step 1.5)', lyria: 'Google Lyria' };
 /** ACE-Step is the music engine. (Google Lyria is only tried if LYRIA_ENABLED=true with a paid Gemini key.) */
 async function generateMusicTrack(song: MusicalSong): Promise<{ file: string; duration: number; engine: string }> {
   const available = ['acestep', 'lyria'].filter((p) => (p === 'acestep' ? true : CFG.lyriaEnabled && CFG.geminiKeys.length > 0));
@@ -3931,49 +3856,22 @@ async function generateMusicTrack(song: MusicalSong): Promise<{ file: string; du
   throw new PipelineError('music_all_failed', `Music generation failed — ${errors.join(' | ')}. Nothing was posted; the next run will retry.`);
 }
 
-/**
- * Word-level lyric timing with Whisper on THIS runner (faster-whisper, CPU int8) — no API keys,
- * no outside transcription service.
- */
-async function transcribeLocal(file: string): Promise<Word[]> {
-  const python = ENV.PYTHON || 'python3';
-  const chk = await run(python, ['-c', 'import faster_whisper'], { timeoutMs: 60000 });
-  if (chk.code !== 0) {
-    const ins = await run(python, ['-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', 'faster-whisper'], { timeoutMs: 10 * 60000 });
-    if (ins.code !== 0) { log(`⚠️ faster-whisper could not be installed (${ins.stderr.slice(-200)}).`); return []; }
+/** Speech → timed words with hosted Groq Whisper (through the app server, keys rotated). Nothing runs on this CPU. */
+async function hostedWords(file: string, language: string, hint: string): Promise<{ text: string; start: number; end: number }[]> {
+  if (!RELAY.available) { log('⚠️ Speech recognition needs the app address and runner key.'); return []; }
+  const wav = path.join(WORK_DIR, `asr_${crypto.randomBytes(4).toString('hex')}.wav`);
+  if ((await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', file, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav], { timeoutMs: 120000 })).code !== 0) return [];
+  const bytes = new Uint8Array(fs.readFileSync(wav));
+  const lang = language && !['unknown', 'pcm'].includes(language) ? language.slice(0, 2) : '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await RELAY.stt(bytes, 'audio/wav', { language: lang, prompt: hint.slice(0, 220) });
+      return r.words.map((w) => ({ text: w.word, start: w.start, end: w.end })).filter((w) => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
+    } catch (e: any) { log(`⚠️ Speech recognition attempt ${attempt + 1} failed (${String(e?.message || e).slice(0, 160)}).`); await sleep(3000 * (attempt + 1)); }
   }
-  const py = path.join(WORK_DIR, 'lyrics_asr.py');
-  fs.writeFileSync(py, `import json,sys,os
-import av as _av
-_av_open=_av.open
-def _open(*a,**k):
-  k.pop("metadata_errors",None)
-  return _av_open(*a,**k)
-_av.open=_open
-def _pcm(p):
-  import subprocess,numpy as np
-  try:
-    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
-    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
-    return a if a.size>1600 else p
-  except Exception:
-    return p
-from faster_whisper import WhisperModel
-m=WhisperModel("small",device="cpu",compute_type="int8",cpu_threads=os.cpu_count() or 2)
-lang=sys.argv[2] if len(sys.argv)>2 and sys.argv[2] not in ("","unknown","pcm") else None
-segs,_=m.transcribe(_pcm(sys.argv[1]),word_timestamps=True,vad_filter=False,language=lang)
-out=[]
-for s in segs:
-  for w in (s.words or []): out.append({"text":w.word.strip(),"start":w.start,"end":w.end})
-print(json.dumps(out))
-`);
-  const r = await run(python, [py, file, musicLanguage().code], { timeoutMs: 20 * 60000 });
-  if (r.code !== 0) { log(`⚠️ Local lyric transcription failed (${r.stderr.slice(-200)}).`); return []; }
-  try {
-    const list = JSON.parse(r.stdout.toString().trim().split('\n').pop() || '[]');
-    return (Array.isArray(list) ? list : []).filter((w: any) => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
-  } catch { return []; }
+  return [];
 }
+async function transcribeLocal(file: string): Promise<Word[]> { return (await hostedWords(file, musicLanguage().code, '')) as unknown as Word[]; }
 
 // ---------------------------------------------------------------------------
 // Stem separation (Demucs, open-source, runs on the GitHub runner's CPU).
@@ -4183,7 +4081,6 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
 }
 async function produceMusical(t0: number, pastTitles: string[]): Promise<number> {
   // Start installing / loading ACE-Step on this runner right away, while the lyrics are written.
-  prepareLocalAce().catch(() => {});
   await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
   const song = await writeMusicalSong(pastTitles);
   let generated = await generateMusicTrack(song);
@@ -4278,51 +4175,10 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
 // ---------------------------------------------------------------------------
 // Studio → Create animation: the user's own script / voice → one finished MP4 for the app.
 // ---------------------------------------------------------------------------
-/** Speech → words with timings (faster-whisper on this runner, installed on first use). */
+/** Speech → words with timings (hosted Groq Whisper through the app server). */
 async function transcribeVoice(audio: string, hint: string): Promise<Word[] | null> {
-  const venv = path.join(os.homedir(), 'asr-venv');
-  let py = path.join(venv, 'bin', 'python');
-  if (!fs.existsSync(py) || (await run(py, ['-c', 'import faster_whisper'], { timeoutMs: 60000 })).code !== 0) {
-    log('Setting up speech recognition (first time only)…');
-    if ((await run('python3', ['-m', 'venv', venv], { timeoutMs: 180000 })).code !== 0) py = 'python3';
-    let r = await run(py, ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', 'faster-whisper'], { timeoutMs: 900000 });
-    if (r.code !== 0) r = await run(py, ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--break-system-packages', 'faster-whisper'], { timeoutMs: 900000 });
-    if ((await run(py, ['-c', 'import faster_whisper'], { timeoutMs: 60000 })).code !== 0) { log(`Speech recognition unavailable: ${r.stderr.slice(-200)}`); return null; }
-  }
-  const script = path.join(WORK_DIR, 'studio_asr.py');
-  fs.writeFileSync(script, `import json,sys
-import av as _av
-_av_open=_av.open
-def _open(*a,**k):
-  k.pop("metadata_errors",None)
-  return _av_open(*a,**k)
-_av.open=_open
-def _pcm(p):
-  import subprocess,numpy as np
-  try:
-    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
-    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
-    return a if a.size>1600 else p
-  except Exception:
-    return p
-from faster_whisper import WhisperModel
-audio,hint,out=sys.argv[1],sys.argv[2],sys.argv[3]
-m=WhisperModel("base",device="cpu",compute_type="int8",cpu_threads=4)
-segs,info=m.transcribe(_pcm(audio),word_timestamps=True,beam_size=1,condition_on_previous_text=False,initial_prompt=(hint or None))
-words=[]
-for s in segs:
-  for w in (s.words or []):
-    t=w.word.strip()
-    if t: words.append({"text":t,"start":round(w.start,3),"end":round(w.end,3)})
-json.dump(words,open(out,"w"))
-`);
-  const wav = path.join(WORK_DIR, 'studio_asr.wav');
-  if ((await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', audio, '-ac', '1', '-ar', '16000', wav], { timeoutMs: 120000 })).code !== 0) return null;
-  const out = path.join(WORK_DIR, 'studio_asr.json');
-  const r = await run(py, [script, wav, hint.slice(0, 220), out], { timeoutMs: 30 * 60_000 });
-  if (r.code !== 0 || !fs.existsSync(out)) { log(`Transcription failed: ${r.stderr.slice(-200)}`); return null; }
-  const list: { text: string; start: number; end: number }[] = JSON.parse(fs.readFileSync(out, 'utf8') || '[]');
-  return list.length ? list.map((w, i) => ({ text: w.text.replace(/\s+/g, ''), start: w.start, end: w.end, token: i })) : null;
+  const list = await hostedWords(audio, '', hint);
+  return list.length ? list.map((w, i) => ({ text: w.text.replace(/\s+/g, ''), start: w.start, end: w.end, token: i })) as unknown as Word[] : null;
 }
 
 /** The user's recording: trimmed to the plan's length, levelled, and turned into timed words. */

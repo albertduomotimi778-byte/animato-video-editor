@@ -59,36 +59,8 @@ jobs:
           ffmpeg -hide_banner -version | head -n 1
           nproc
 
-      # The app's own AI model (llama.cpp + Gemma 4 E4B/E2B) runs on this runner: no API keys.
-      - name: Cache the AI model
-        uses: actions/cache@v4
-        with:
-          path: ~/animato-llm
-          key: animato-llm-gemma4-adaptive-q4_0-v3-${{ runner.os }}
-
-      - name: Start the AI model (self-hosted)
-        run: bash animato-cloud/llm_server.sh
-
-      - name: Cache speech-to-text (Whisper)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/asr-venv
-            ~/.cache/huggingface
-          key: animato-asr-v1-${{ runner.os }}-py312
-
-      - name: Set up speech-to-text (Whisper on this runner)
-        run: |
-          VENV="$HOME/asr-venv"
-          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import faster_whisper" >/dev/null 2>&1; then rm -rf "$VENV"; fi
-          if [ ! -d "$VENV" ]; then
-            python -m venv "$VENV"
-            "$VENV/bin/pip" install -q --disable-pip-version-check --upgrade pip
-            "$VENV/bin/pip" install -q --disable-pip-version-check faster-whisper
-          fi
-          "$VENV/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('Whisper ready')" \
-            && echo "ASR_PYTHON=$VENV/bin/python" >> "$GITHUB_ENV" \
-            || echo "::warning::Whisper could not be prepared here - the editor installs it itself"
+      # AI (Gemini first for editing, Groq/OpenRouter fallbacks) and speech-to-text (Groq Whisper) are hosted:
+      # the runner asks the app server, which holds and rotates the keys. Nothing is installed or run on this CPU.
 
       - name: Edit the video
         if: github.event_name == 'repository_dispatch'
