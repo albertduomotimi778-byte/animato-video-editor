@@ -4134,12 +4134,90 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
   if (sections.length) sections[sections.length - 1].end = duration;
   return { words, sections };
 }
+/**
+ * Music video performed to the person's OWN song (Creative Studio → "Use my own music").
+ * The uploaded file is fetched from the app, trimmed to the video length limit (with a short fade-out when it is cut)
+ * and converted to a plain stereo WAV, then goes through exactly the same stem separation, lyric timing, singer
+ * lip-sync and band performance as an AI-composed song.
+ */
+async function loadUploadedSong(): Promise<{ file: string; duration: number; engine: string }> {
+  const S = STUDIO!;
+  if (!S.musicUrl) throw new PipelineError('music_missing', 'Your own song was selected, but no audio file arrived. Please upload it again.');
+  await reportStatus('running', '2/6 Preparing your song', 24, 'Loading your own music…');
+  const response = await fetch(`${CFG.appUrl.replace(/\/+$/, '')}${S.musicUrl}`, { headers: { 'X-Animato-Runner-Key': CFG.runnerKey } });
+  if (!response.ok) throw new PipelineError('music_fetch_failed', `Could not fetch your uploaded song (HTTP ${response.status}).`);
+  const raw = path.join(WORK_DIR, `own_song_${S.id}.audio`);
+  fs.writeFileSync(raw, Buffer.from(await response.arrayBuffer()));
+  const full = await probeDuration(raw);
+  if (!(full > 0)) throw new PipelineError('music_unreadable', 'Your uploaded file could not be read as audio. Try an MP3, M4A or WAV file.');
+  const limit = Math.max(15, Math.min(60, S.maxSeconds || 60));
+  const keep = Math.min(full, limit);
+  const out = path.join(WORK_DIR, `own_song_${S.id}.wav`);
+  const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-vn', '-t', keep.toFixed(2), '-ac', '2', '-ar', '44100'];
+  if (full > limit + 0.5) args.push('-af', `afade=t=out:st=${Math.max(0, keep - 1.5).toFixed(2)}:d=1.5`);
+  args.push('-c:a', 'pcm_s16le', out);
+  const r = await run('ffmpeg', args, { timeoutMs: 180000 });
+  if (r.code !== 0 || !fs.existsSync(out)) throw new PipelineError('music_unreadable', 'Your uploaded file could not be converted. Try an MP3, M4A or WAV file.');
+  const duration = await probeDuration(out);
+  if (duration < 5) throw new PipelineError('music_too_short', `Your song is only ${duration.toFixed(1)}s long — use a track of at least 5 seconds.`);
+  log(`🎵 Using the uploaded song: ${duration.toFixed(1)}s${full > limit + 0.5 ? ` (trimmed from ${full.toFixed(0)}s)` : ''}.`);
+  return { file: out, duration, engine: 'upload' };
+}
+/**
+ * Own song with NO lyrics typed in: build the lyric lines and sections from what was actually sung in the track
+ * (Whisper transcript of the isolated vocals), so the captions and singer timing still work.
+ * If nothing intelligible was heard (instrumental, or a language the transcriber could not read) the captions
+ * show a music note instead of made-up words.
+ */
+function songFromTranscript(words: Word[], title: string): MusicalSong {
+  const style = String(CFG.subGenre || 'original music');
+  const gender = CFG.gender === 'male' ? 'male' : 'female';
+  const lines: string[] = [];
+  let cur: string[] = [], prevEnd = -1;
+  const flush = () => { if (cur.length) lines.push(cur.join(' ')); cur = []; };
+  for (const w of words) {
+    const t = String(w.text || '').trim();
+    if (!t) continue;
+    if (cur.length && ((prevEnd >= 0 && w.start - prevEnd > 0.8) || cur.length >= 7)) flush();
+    cur.push(t); prevEnd = w.end;
+    if (/[.!?]$/.test(t) && cur.length >= 3) flush();
+  }
+  flush();
+  const calm = musicalProfile().emotion;
+  let sections: MusicalSection[];
+  if (words.length > 5 && lines.length >= 2) {
+    const key = (l: string) => l.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const counts = new Map<string, number>();
+    for (const l of lines) counts.set(key(l), (counts.get(key(l)) || 0) + 1);
+    sections = [];
+    for (let i = 0; i < lines.length; i += 4) {
+      const group = lines.slice(i, i + 4);
+      const repeated = group.some((l) => (counts.get(key(l)) || 0) >= 2);
+      sections.push({ tag: repeated ? 'chorus' : 'verse', lyrics: group.join('\n'), emotion: repeated ? 'excited' : calm });
+    }
+  } else {
+    log('🎵 No sung words could be made out in your song — the video will show a music note instead of lyrics.');
+    sections = [{ tag: 'verse', lyrics: '♪', emotion: calm }, { tag: 'chorus', lyrics: '♪', emotion: 'excited' }, { tag: 'verse', lyrics: '♪', emotion: calm }];
+  }
+  const firstLine = lines[0] || '';
+  const name = String(title || '').trim() || firstLine.replace(/[.!?,].*$/, '').slice(0, 70).trim() || 'My Music Video';
+  return { title: name.slice(0, 90), description: `Music video performed to the artist's own ${style} track by a ${gender} lead singer.`, lyrics: sectionLyricText(sections), sections, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
+}
 async function produceMusical(t0: number, pastTitles: string[]): Promise<number> {
   // Start installing / loading ACE-Step on this runner right away, while the lyrics are written.
-  await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
-  const song = await writeMusicalSong(pastTitles);
-  let generated = await generateMusicTrack(song);
-  const engineName = generated.engine === 'lyria' ? 'google-lyria' : 'ace-step-1.5';
+  const ownSong = STUDIO?.kind === 'musical' && STUDIO.musicMode === 'upload';
+  // Own song and no lyrics typed in: do not write a new song — the words are taken from the track itself below.
+  const lyricsFromTrack = ownSong && !cleanMusicLyrics(String(CFG.musicalLyrics || '')).trim();
+  let song: MusicalSong;
+  if (lyricsFromTrack) {
+    await reportStatus('running', '1/6 Getting ready', 10, 'Using your own song — the lyrics will be picked up from the track.');
+    song = songFromTranscript([], String(STUDIO?.title || ''));
+  } else {
+    await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
+    song = await writeMusicalSong(pastTitles);
+  }
+  let generated = ownSong ? await loadUploadedSong() : await generateMusicTrack(song);
+  const engineName = generated.engine === 'upload' ? 'user-upload' : generated.engine === 'lyria' ? 'google-lyria' : 'ace-step-1.5';
   let stems = await separateStems(generated.file, generated.duration);
   let vocalSpans = stems ? await vocalSpansOf(stems.vocals).catch(() => []) : [];
   // Voice check: the song must be sung by the singer the user chose (female / male).
@@ -4165,6 +4243,7 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   if (stems) log(`🎚 ${vocalSpans.length} sung phrases; drums level ${drumLevel.toFixed(2)}, keys/other level ${keysLevel.toFixed(2)}.`);
   // Transcribe the isolated vocals when we have them (far cleaner than the full mix).
   const transcript = await transcribeSong(stems?.vocals || generated.file);
+  if (lyricsFromTrack) song = songFromTranscript(transcript, String(STUDIO?.title || ''));
   const timing = timingForMusic(song, transcript, generated.duration, vocalSpans);
   if (!transcript.length && vocalSpans.length) log(`Lyric timing: no transcript — ${timing.words.length} words laid over ${vocalSpans.length} sung phrases.`);
   const cues = timing.sections.flatMap((sg) => [{ t: sg.start, tag: sg.emotion }, ...(sg.tag === 'chorus' ? [{ t: sg.start + 0.15, tag: 'excited' }] : [])]).filter((x) => EMOTION_TAGS.includes(x.tag));
