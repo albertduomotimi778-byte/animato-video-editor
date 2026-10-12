@@ -2754,6 +2754,8 @@ async function findMusic(seconds: number, narration: Narration): Promise<string 
 
 /** Audio: narration + the music bed (already levelled under the voice). */
 function audioArgs(narration: string, music: string | null, firstInput: number): { inputs: string[]; filter: string } {
+  // Only a real file path counts as music (an empty list/blank string would hand ffmpeg a blank input).
+  if (typeof music !== 'string' || !music || !fs.existsSync(music)) music = null;
   const inputs = ['-i', narration];
   if (music) inputs.push('-stream_loop', '-1', '-i', music);
   const v = firstInput, m = firstInput + 1;
@@ -4581,7 +4583,7 @@ async function produceStudio(t0: number): Promise<number> {
   const times = timeScenes(script.scenes, narration.words, duration);
   const cues = timeCues(script.scenes, narration.words, times);
   await reportStatus('running', 'Finding pictures for the scenes', 45, `${script.scenes.length} scenes.`);
-  const [{ files: images, credits }, generatedMusic] = await Promise.all([gatherImages(script), S.musicMode === 'none' || S.musicMode === 'upload' ? Promise.resolve([] as any[]) : findMusic(duration, narration)]);
+  const [{ files: images, credits }, generatedMusic] = await Promise.all([gatherImages(script), S.musicMode === 'none' || S.musicMode === 'upload' ? Promise.resolve(null as string | null) : findMusic(duration, narration)]);
   const music = generatedMusic;
   await reportStatus('running', 'Animating your character', 62, 'Animating.');
   const badge = S.kind === 'kids' ? 'KIDS' : S.kind === 'story' ? 'STORY' : S.kind === 'talk' || S.kind === 'motivation' ? '' : S.kind.toUpperCase();
