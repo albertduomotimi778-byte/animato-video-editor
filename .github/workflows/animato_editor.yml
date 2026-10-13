@@ -3,7 +3,8 @@
 # Installed and kept up to date automatically by the Animato app.
 # One run edits ONE upload: transcribe the voice, cut fillers / retakes /
 # dead air, match the video to what is said and compile the final MP4 with
-# the captions drawn onto the picture.
+# the captions drawn onto the picture. A screen recording with NO voice is
+# watched by the AI, trimmed, narrated with a neural voice and subtitled.
 
 name: Animato AI Video Editor
 
@@ -48,6 +49,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Install the voice engine (narrates silent screen recordings)
+        continue-on-error: true
+        run: python -m pip install --quiet --disable-pip-version-check edge-tts
 
       - name: Install FFmpeg
         run: |
