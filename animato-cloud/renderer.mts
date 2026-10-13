@@ -1578,6 +1578,7 @@ async function synthesizeNarration(script: string): Promise<Narration> {
   const voices = (VOICES[CFG.gender][CFG.category] || VOICES[CFG.gender].default);
 
   let lastTtsError = '';
+  let blocked403 = 0;
   if (!CFG.offline) {
     // Each voice at the category's pace, then at normal pace; short pause between
     // attempts so a transient Edge TTS hiccup does not cost the run.
@@ -1609,6 +1610,8 @@ async function synthesizeNarration(script: string): Promise<Narration> {
       }
       lastTtsError = r.stderr.trim().split('\n').filter(Boolean).slice(-2).join(' | ') || `exit ${r.code}`;
       log(`edge-tts with ${voice} (${rate}) failed (exit ${r.code}): ${lastTtsError}`);
+      // Microsoft is refusing this runner (HTTP 403): more voices will not help, switch engines now.
+      if (/\b403\b/.test(lastTtsError) && ++blocked403 >= 2) { log('Edge TTS keeps answering 403 - switching to the Piper neural voice on this runner.'); break; }
     }
   }
   LAST_TTS_ERROR = lastTtsError;
@@ -1632,6 +1635,25 @@ async function synthesizeNarration(script: string): Promise<Narration> {
   return { audioPath: wav, duration, words: estimateWordTimes(text, duration), wordsReliable: false, engine: `flite:${voice}`, neural: false };
 }
 
+/** Download any file (voice models, etc.) - unlike download(), which only accepts images. Retries twice. */
+async function downloadFile(url: string, file: string, timeoutMs = 120000): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': 'AnimatoAutoPoster/3.0 (+https://github.com)' }, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 100) throw new Error('empty download');
+      fs.writeFileSync(file, buf);
+      return true;
+    } catch (e: any) {
+      log(`Download of ${path.basename(file)} failed (${String(e?.message || e).slice(0, 120)}) - attempt ${attempt + 1}/3.`);
+      try { fs.unlinkSync(file); } catch {}
+      await sleep(2000 * (attempt + 1));
+    }
+  }
+  return false;
+}
+
 /** Piper (rhasspy) neural text-to-speech, installed on the runner on first use. */
 async function piperNarration(textFile: string): Promise<{ file: string; duration: number; voice: string } | null> {
   const root = path.join(os.homedir(), 'animato-piper'), venv = path.join(root, 'venv'), py = path.join(venv, 'bin', 'python');
@@ -1647,7 +1669,7 @@ async function piperNarration(textFile: string): Promise<{ file: string; duratio
   for (const ext of ['', '.json']) {
     const f = model + ext;
     if (!fs.existsSync(f) || fs.statSync(f).size < 100) {
-      const ok = await download(`https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${vpath}/${voice}.onnx${ext}`, f, 180000);
+      const ok = await downloadFile(`https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${vpath}/${voice}.onnx${ext}`, f, 240000);
       if (!ok) throw new Error(`could not download the ${voice} voice`);
     }
   }
