@@ -216,7 +216,7 @@ interface StudioJob {
   id: string; kind: string; title: string; script: string; voiceUrl: string; voiceGender: 'female' | 'male';
   cast: { name: string; gender: 'female' | 'male'; spec: any }[]; watermark: boolean; maxSeconds: number;
   location: string; time: 'day' | 'night'; showCharacter: boolean; fast: boolean; musicMode?: 'auto' | 'upload' | 'none'; musicUrl?: string; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
-  musicLanguage?: string; subGenre?: string; stageMode?: 'auto' | 'fixed'; stageId?: number;
+  musicLanguage?: string; subGenre?: string; mood?: string; stageMode?: 'auto' | 'fixed'; stageId?: number;
   podcastStudio?: any; podcastHosts?: any[]; adWebsiteUrl?: string; adBrief?: string; adImages?: string[]; adProfile?: any;
 }
 const STUDIO: StudioJob | null = (() => {
@@ -231,7 +231,7 @@ const STUDIO: StudioJob | null = (() => {
     location: String(s.location || 'living_room'), time: s.time === 'night' ? 'night' : 'day', showCharacter: s.showCharacter !== false, fast: s.fast === true,
     musicMode: s.musicMode === 'none' ? 'none' : s.musicMode === 'upload' ? 'upload' : 'auto', musicUrl: String(s.musicUrl || ''),
     scenes: Array.isArray(s.scenes) ? s.scenes.slice(0, 8) : [],
-    musicLanguage: String(s.musicLanguage || 'English').slice(0, 40), subGenre: String(s.subGenre || 'afrobeats').slice(0, 80),
+    musicLanguage: String(s.musicLanguage || 'English').slice(0, 40), subGenre: String(s.subGenre || 'afrobeats').slice(0, 80), mood: String(s.mood || '').toLowerCase().replace(/[^a-z]/g, '').slice(0, 20),
     stageMode: s.stageMode === 'fixed' ? 'fixed' : 'auto', stageId: Math.max(0, Math.min(1_000_000, Number(s.stageId) || 0)),
     podcastStudio: s.podcastStudio || null, podcastHosts: Array.isArray(s.podcastHosts) ? s.podcastHosts.slice(0, 3) : [],
     adWebsiteUrl: String(s.adWebsiteUrl || '').slice(0, 600), adBrief: String(s.adBrief || '').slice(0, 14000), adImages: Array.isArray(s.adImages) ? s.adImages.slice(0, 12).map(String) : [], adProfile: s.adProfile && typeof s.adProfile === 'object' ? s.adProfile : null,
@@ -2793,7 +2793,7 @@ async function renderWithStage(opts: {
   title: string; badge: string; endCard: string; music: string | null; duration: number; credits?: (string | null)[]; musicalStage?: boolean; chorusIntervals?: { start: number; end: number }[];
   /** Override the canvas the stage renders at (used for ads that render landscape then get framed into a Short — see adLandscapeShort). Defaults to the job's actual frame. */
   size?: { w: number; h: number };
-  musical?: { stageId?: number; stageAutoSeed?: string; style?: string; sections?: { start: number; end: number; tag: string; emotion?: string }[]; vocalSpans?: { start: number; end: number }[]; drumLevel?: number; keysLevel?: number };
+  musical?: { mood?: string; stageId?: number; stageAutoSeed?: string; style?: string; sections?: { start: number; end: number; tag: string; emotion?: string }[]; vocalSpans?: { start: number; end: number }[]; drumLevel?: number; keysLevel?: number };
   stems?: Stems;
   lyrics?: { lines: { text: string; en: string }[]; noSpaces: boolean };
 }): Promise<{ ok: boolean; character: string; reason?: string }> {
@@ -3388,6 +3388,43 @@ interface MusicalSong {
   hashtags: string[];
   tags: string[];
 }
+/**
+ * The feeling of the song the person picked (happy, sad, emotional…). It decides the singer's and the band's faces
+ * for every part of the song, the lyrics' and the music's feeling, and (in the stage) the lighting and atmosphere.
+ * Not chosen (automations) = the old behaviour.
+ */
+interface SongMoodSpec {
+  /** Emotion tag for intro / verse / pre-chorus, for chorus (and bridge), for the LAST chorus, and for the outro. */
+  verse: string; chorus: string; finalChorus?: string; outro: string;
+  /** Written into the lyric-writing prompt. */
+  brief: string;
+  /** Written into the music engine's prompt, and whether it replaces the genre's own (often upbeat) tags. */
+  tags: string; vocal: string; replaceGenre: boolean; bpm?: [number, number]; minorKeys?: string[];
+}
+const SONG_MOODS: Record<string, SongMoodSpec> = {
+  happy: { verse: 'happy', chorus: 'excited', outro: 'happy', brief: 'joyful, bright, celebratory and uplifting — smiling, feel-good lyrics', tags: 'happy, joyful, bright major key, uplifting, feel-good', vocal: 'bright, smiling, joyful vocal', replaceGenre: false },
+  sad: { verse: 'sad', chorus: 'sad', finalChorus: 'crying', outro: 'sad', brief: 'SAD and heartbreaking — loss, longing, goodbye or regret. The words, the story and the feeling must all be sorrowful. Nothing cheerful, no party or celebration lines, no happy ending', tags: 'sad emotional ballad, slow tempo, minor key, melancholic, heartbreaking, sparse piano, sorrowful strings, wide reverb', vocal: 'breathy, vulnerable, tearful vocal with a crack of pain', replaceGenre: true, bpm: [62, 76], minorKeys: ['A minor', 'D minor', 'E minor', 'F# minor'] },
+  emotional: { verse: 'worried', chorus: 'sad', outro: 'calm', brief: 'deeply EMOTIONAL and touching — heartfelt, tender, vulnerable and moving, with real feeling in every line (bittersweet, not cheerful)', tags: 'emotional heartfelt ballad, tender, touching, slow build, piano and strings, soft dynamics rising to a powerful chorus', vocal: 'tender, heartfelt, moved vocal with long held notes', replaceGenre: true, bpm: [66, 82], minorKeys: ['A minor', 'D minor', 'Bb major', 'F major'] },
+  romantic: { verse: 'calm', chorus: 'happy', outro: 'calm', brief: 'ROMANTIC and loving — warm, intimate, tender love lyrics', tags: 'romantic love song, warm, intimate, smooth, lush chords, soft groove', vocal: 'warm, loving, intimate vocal', replaceGenre: false, bpm: [70, 92] },
+  energetic: { verse: 'excited', chorus: 'excited', outro: 'happy', brief: 'HIGH-ENERGY, party and hype — confident, loud, fun and full of movement', tags: 'high energy, party, hype, driving beat, big chorus, powerful', vocal: 'energetic, punchy, hyped vocal', replaceGenre: false },
+  angry: { verse: 'serious', chorus: 'angry', outro: 'serious', brief: 'ANGRY and intense — defiance, frustration, power, raw confrontation', tags: 'aggressive, intense, dark, hard-hitting drums, driving bass, defiant', vocal: 'raw, fierce, intense vocal', replaceGenre: false },
+  hopeful: { verse: 'calm', chorus: 'happy', outro: 'happy', brief: 'HOPEFUL and inspiring — rising from hardship, faith, light after darkness', tags: 'hopeful, inspiring, uplifting, warm, building to a soaring chorus', vocal: 'warm, sincere, uplifted vocal', replaceGenre: false },
+  peaceful: { verse: 'calm', chorus: 'calm', outro: 'calm', brief: 'PEACEFUL and calm — gentle, soothing, serene lyrics', tags: 'peaceful, calm, gentle, soft acoustic textures, soothing, spacious', vocal: 'soft, serene, gentle vocal', replaceGenre: true, bpm: [64, 84] },
+};
+/** The chosen song mood id, or '' when the person did not choose one. */
+function songMood(): string {
+  const id = String(STUDIO?.mood || (typeof JOB !== 'undefined' ? (JOB as any).song_mood : '') || '').toLowerCase().replace(/[^a-z]/g, '');
+  return SONG_MOODS[id] ? id : '';
+}
+/** The face/emotion for a song part under the chosen mood (null = not chosen: keep the part's own emotion). */
+function moodSectionEmotion(tag: string, chorusNo: number, chorusCount: number): string | null {
+  const m = SONG_MOODS[songMood()];
+  if (!m) return null;
+  if (tag === 'chorus') return chorusNo === chorusCount && m.finalChorus ? m.finalChorus : m.chorus;
+  if (tag === 'bridge') return m.chorus;
+  if (tag === 'outro') return m.outro;
+  return m.verse;
+}
 const MUSICAL_PROFILES: Record<string, { style: string; emotion: string; instruments: string }> = {
   'sad / heartbreak': { style: 'cinematic emotional pop ballad, intimate lead vocal, piano, warm strings, restrained drums, spacious reverb', emotion: 'sad', instruments: 'piano and cinematic strings' },
   'happy / feel-good': { style: 'bright uplifting pop, catchy melodic hook, warm live drums, guitars, handclaps, polished radio mix', emotion: 'happy', instruments: 'bright guitars, handclaps and live drums' },
@@ -3431,6 +3468,19 @@ const GENRE_FEEL: Record<string, { bpm: [number, number]; keys: string[]; tags: 
 };
 /** This video's tempo / key / production for the genre (stable per video, varied between videos). */
 function genreFeel(): { bpm: number; key: string; tags: string; vocal: string } {
+  const base = genreFeelBase(), m = SONG_MOODS[songMood()];
+  if (!m) return base;
+  const n = parseInt(crypto.createHash('md5').update(`${CFG.campaignId || CFG.campaignName}:${CFG.partNumber}:moodfeel`).digest('hex').slice(0, 8), 16);
+  const genreName = String(CFG.subGenre || '').trim();
+  return {
+    bpm: m.bpm ? m.bpm[0] + (n % (m.bpm[1] - m.bpm[0] + 1)) : base.bpm,
+    key: m.minorKeys ? m.minorKeys[Math.floor(n / 7) % m.minorKeys.length] : base.key,
+    // A sad song keeps the genre's flavour but not its party tempo and bounce.
+    tags: m.replaceGenre ? `${m.tags}${genreName ? `, ${genreName} influences` : ''}` : `${m.tags}, ${base.tags}`,
+    vocal: m.replaceGenre ? m.vocal : `${m.vocal}, ${base.vocal}`,
+  };
+}
+function genreFeelBase(): { bpm: number; key: string; tags: string; vocal: string } {
   const k = String(CFG.subGenre || '').trim().toLowerCase();
   const g = GENRE_FEEL[k];
   const n = parseInt(crypto.createHash('md5').update(`${CFG.campaignId || CFG.campaignName}:${CFG.partNumber}:feel`).digest('hex').slice(0, 8), 16);
@@ -3438,6 +3488,12 @@ function genreFeel(): { bpm: number; key: string; tags: string; vocal: string } 
   return { bpm: g.bpm[0] + (n % (g.bpm[1] - g.bpm[0] + 1)), key: g.keys[Math.floor(n / 7) % g.keys.length], tags: g.tags, vocal: g.vocal };
 }
 function musicalProfile(): { style: string; emotion: string; instruments: string } {
+  const p = musicalProfileBase(), mood = songMood();
+  if (!mood) return p;
+  // The person's chosen feeling wins over what the genre usually feels like.
+  return { ...p, emotion: mood === 'sad' ? 'sad' : mood === 'emotional' ? 'emotional and tender' : mood === 'angry' ? 'angry' : mood === 'peaceful' ? 'calm' : SONG_MOODS[mood].chorus };
+}
+function musicalProfileBase(): { style: string; emotion: string; instruments: string } {
   const k = String(CFG.subGenre || '').trim().toLowerCase();
   if (MUSICAL_PROFILES[k]) return MUSICAL_PROFILES[k];
   // A custom genre typed in the app: use it as the direction itself.
@@ -3647,7 +3703,7 @@ async function writeMusicalSong(pastTitles: string[]): Promise<MusicalSong> {
   const idea = songConcept();
   log(`🎵 Song idea (${idea.theme}): ${idea.concept}`);
   const meaning = `WHAT THE SONG IS ABOUT (mandatory): ${idea.concept}. Tell THIS story from the singer’s point of view. Every single line must belong to it — concrete people, places, objects and actions (a named street, mama’s kitchen, the bus stop, the DJ booth, a phone screen…), one clear emotion, and a message a listener can repeat in one sentence. No vague filler about “good vibes”, “just the good”, “feeling good tonight” with nothing behind it; at most one short ad-lib (e.g. “eh!”) per section. `;
-  const user = `${meaning}Write one completely ORIGINAL ${IS_SHORTS ? 'short-form' : 'full-length'} song for a music video. LANGUAGE: write the title and ALL the lyrics in ${lang.name}${lang.name.toLowerCase() === 'english' ? '' : ` (natural, idiomatic ${lang.name} as native songwriters write it — not a translation; the description and tags may be in English)`}. Lead vocalist gender: ${gender}. Style/mood: ${CFG.subGenre || 'cinematic pop'}. Musical direction: ${profile.style}. Emotional performance must fit the style. The lyrics must be clean, singable, coherent and specific, with natural rhymes and a memorable chorus. ${CFG.musicSeconds <= 40 ? `The song is ONLY ${CFG.musicSeconds} SECONDS long, so every line must count. Use exactly this structure: INTRO (2 short lines that set the scene of the story — who, where, what just happened — so the listener is hooked and knows what the song is about), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and again in line 3 or 4; lines 2 and 4 add the feeling/detail and rhyme; this is most of the song), OUTRO (2 lines that land the story — a payoff, a twist or a punchline that answers the intro — ending on the hook). No verses, no bridge. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : CFG.musicSeconds <= 75 ? `The song is about ${CFG.musicSeconds} SECONDS long and must feel like a real hit single cut down to one minute, with a complete song structure. Write exactly five sections, in this order: INTRO (2 short lines — a call-out or vocal hook that sets the mood and hints at the story), VERSE (4 short lines that tell the story with concrete detail — who, where, what happened; natural rhymes), PRE-CHORUS (tag "prechorus": 2 short lines that lift the energy and build anticipation — a rising question, promise or turn — so the chorus explodes), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and repeated in line 3 or 4; lines 2 and 4 add the feeling and rhyme; simple, singable, built for people to sing along — the emotional release of the verse), OUTRO (2 lines that land the story — a payoff or twist — ending on the hook). Keep every line short (4–8 words) so it fits the beat. The CHORUS will be sung TWICE back to back. The emotion, rhythm and slang of every line must match the genre: ${(() => { const f = genreFeel(); return `${f.tags}; vocal: ${f.vocal}${f.bpm ? `; about ${f.bpm} BPM` : ''}`; })()}. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : 'Use this structure when it helps: intro, verse, pre-chorus, chorus, verse 2, pre-chorus, chorus, bridge, final chorus, outro.'} The chorus must be strong enough for a choir to answer behind the lead. Do not quote, adapt, imitate or reuse any copyrighted lyrics or named artist/song. Return JSON only with title, description, lyrics, sections (array of {tag,lyrics,emotion}), hashtags, tags. ${CFG.musicSeconds <= 75 ? `Use about ${Math.round(CFG.musicSeconds * 0.95)}–${Math.round(CFG.musicSeconds * 1.25)} lyric words in total across intro + verse + pre-chorus + chorus + outro (the chorus repeats, so the sung total is higher).` : `Aim for at least ${IS_SHORTS ? 90 : 220} lyric words.`} Previous titles to avoid repeating: ${already || '(none)'}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it — the mood, hook style and subjects of the best songs):\n${CFG.performanceNotes}` : ''}`;
+  const user = `${meaning}Write one completely ORIGINAL ${IS_SHORTS ? 'short-form' : 'full-length'} song for a music video. LANGUAGE: write the title and ALL the lyrics in ${lang.name}${lang.name.toLowerCase() === 'english' ? '' : ` (natural, idiomatic ${lang.name} as native songwriters write it — not a translation; the description and tags may be in English)`}. Lead vocalist gender: ${gender}. Style/mood: ${CFG.subGenre || 'cinematic pop'}.${SONG_MOODS[songMood()] ? ` THE FEELING OF THE SONG (mandatory, overrides the style's usual mood): ${SONG_MOODS[songMood()].brief}.` : ''} Musical direction: ${profile.style}. Emotional performance must fit the style. The lyrics must be clean, singable, coherent and specific, with natural rhymes and a memorable chorus. ${CFG.musicSeconds <= 40 ? `The song is ONLY ${CFG.musicSeconds} SECONDS long, so every line must count. Use exactly this structure: INTRO (2 short lines that set the scene of the story — who, where, what just happened — so the listener is hooked and knows what the song is about), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and again in line 3 or 4; lines 2 and 4 add the feeling/detail and rhyme; this is most of the song), OUTRO (2 lines that land the story — a payoff, a twist or a punchline that answers the intro — ending on the hook). No verses, no bridge. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : CFG.musicSeconds <= 75 ? `The song is about ${CFG.musicSeconds} SECONDS long and must feel like a real hit single cut down to one minute, with a complete song structure. Write exactly five sections, in this order: INTRO (2 short lines — a call-out or vocal hook that sets the mood and hints at the story), VERSE (4 short lines that tell the story with concrete detail — who, where, what happened; natural rhymes), PRE-CHORUS (tag "prechorus": 2 short lines that lift the energy and build anticipation — a rising question, promise or turn — so the chorus explodes), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and repeated in line 3 or 4; lines 2 and 4 add the feeling and rhyme; simple, singable, built for people to sing along — the emotional release of the verse), OUTRO (2 lines that land the story — a payoff or twist — ending on the hook). Keep every line short (4–8 words) so it fits the beat. The CHORUS will be sung TWICE back to back. The emotion, rhythm and slang of every line must match the genre: ${(() => { const f = genreFeel(); return `${f.tags}; vocal: ${f.vocal}${f.bpm ? `; about ${f.bpm} BPM` : ''}`; })()}. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : 'Use this structure when it helps: intro, verse, pre-chorus, chorus, verse 2, pre-chorus, chorus, bridge, final chorus, outro.'} The chorus must be strong enough for a choir to answer behind the lead. Do not quote, adapt, imitate or reuse any copyrighted lyrics or named artist/song. Return JSON only with title, description, lyrics, sections (array of {tag,lyrics,emotion}), hashtags, tags. ${CFG.musicSeconds <= 75 ? `Use about ${Math.round(CFG.musicSeconds * 0.95)}–${Math.round(CFG.musicSeconds * 1.25)} lyric words in total across intro + verse + pre-chorus + chorus + outro (the chorus repeats, so the sung total is higher).` : `Aim for at least ${IS_SHORTS ? 90 : 220} lyric words.`} Previous titles to avoid repeating: ${already || '(none)'}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it — the mood, hook style and subjects of the best songs):\n${CFG.performanceNotes}` : ''}`;
   let last = '', fillerRejects = 0;
   for await (const a of LLM.attempts({
     system: 'You are a hit songwriter (think chart-topping Afrobeats/pop writers) and music-video creative director. A great short song tells one specific, relatable story with a hook people sing after one listen. Create original lyrics only. Never provide copyrighted lyrics. Make section labels and emotions explicit so a timed video renderer can stage the performance.',
@@ -4138,6 +4194,7 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
   let lastLine = 0;
   const words = words0.map((w) => { const ln = typeof w.token === 'number' && w.token >= 0 ? lay.tokenLine[w.token] ?? lastLine : lastLine; lastLine = ln; return { ...w, line: ln } as Word; });
   const sections: { start: number; end: number; tag: string; emotion: string }[] = [];
+  const chorusTotal = song.sections.filter((x) => x.tag === 'chorus').length;
   const totalWords = Math.max(1, song.lyrics.split(/\s+/).filter(Boolean).length);
   let cursor = 0;
 
@@ -4154,7 +4211,8 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
     const minEnd = Math.min(duration, start + 0.8);
     const end = clampNum(Math.max(minEnd, roughEnd), minEnd, duration);
     if (end <= start) break;
-    sections.push({ start, end, tag: sec.tag, emotion: sec.emotion || musicalProfile().emotion });
+    const chorusNo = song.sections.slice(0, song.sections.indexOf(sec) + 1).filter((x) => x.tag === 'chorus').length;
+    sections.push({ start, end, tag: sec.tag, emotion: moodSectionEmotion(sec.tag, chorusNo, chorusTotal) || sec.emotion || musicalProfile().emotion });
     // Cursor is monotonic: a matched transcript word can only advance section timing.
     cursor = Math.max(cursor, end);
     if (cursor >= duration) break;
@@ -4275,7 +4333,7 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   if (lyricsFromTrack) song = songFromTranscript(transcript, String(STUDIO?.title || ''));
   const timing = timingForMusic(song, transcript, generated.duration, vocalSpans);
   if (!transcript.length && vocalSpans.length) log(`Lyric timing: no transcript — ${timing.words.length} words laid over ${vocalSpans.length} sung phrases.`);
-  const cues = timing.sections.flatMap((sg) => [{ t: sg.start, tag: sg.emotion }, ...(sg.tag === 'chorus' ? [{ t: sg.start + 0.15, tag: 'excited' }] : [])]).filter((x) => EMOTION_TAGS.includes(x.tag));
+  const cues = timing.sections.flatMap((sg) => [{ t: sg.start, tag: sg.emotion }, ...(sg.tag === 'chorus' ? [{ t: sg.start + 0.15, tag: songMood() ? sg.emotion : 'excited' }] : [])]).filter((x) => EMOTION_TAGS.includes(x.tag));
   const chorusIntervals = timing.sections.filter((s) => s.tag === 'chorus').map((s) => ({ start: s.start, end: s.end }));
   await reportStatus('running', '3/6 Building the music-video performance', 45, `Timed ${timing.words.length} words; ${chorusIntervals.length} chorus sections will bring in the choir.`);
   const lyricLines = lyricLayout(song).lines;
@@ -4285,7 +4343,7 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   const title = song.title;
   const badge = (CFG.subGenre || 'MUSICAL').toUpperCase().slice(0, 24);
   const endCard = 'Follow for the next original song';
-  const stage = await renderWithStage({ narration, scenes: timing.sections.map((s) => ({ narration: s.tag === 'chorus' ? 'CHORUS' : s.tag, shot: 'scene', emotion: s.emotion, imageQuery: '', imageCredit: '' })) as unknown as Scene[], times: timing.sections.map((s) => ({ start: s.start, end: s.end })), cues, images: timing.sections.map(() => null), title, badge, endCard, music: null, duration: generated.duration, musicalStage: true, chorusIntervals, lyrics: { lines: lyricLines.map((text, i) => ({ text, en: lyricEn[i] || '' })), noSpaces: NO_SPACE_LANGS.has(musicLanguage().code) }, musical: { stageId: CFG.stageId || 0, stageAutoSeed: `${STUDIO?.id || CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}:${Date.now()}`, style: CFG.subGenre || '', sections: timing.sections, vocalSpans, drumLevel, keysLevel }, stems: stems || undefined });
+  const stage = await renderWithStage({ narration, scenes: timing.sections.map((s) => ({ narration: s.tag === 'chorus' ? 'CHORUS' : s.tag, shot: 'scene', emotion: s.emotion, imageQuery: '', imageCredit: '' })) as unknown as Scene[], times: timing.sections.map((s) => ({ start: s.start, end: s.end })), cues, images: timing.sections.map(() => null), title, badge, endCard, music: null, duration: generated.duration, musicalStage: true, chorusIntervals, lyrics: { lines: lyricLines.map((text, i) => ({ text, en: lyricEn[i] || '' })), noSpaces: NO_SPACE_LANGS.has(musicLanguage().code) }, musical: { mood: songMood(), stageId: CFG.stageId || 0, stageAutoSeed: `${STUDIO?.id || CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}:${Date.now()}`, style: CFG.subGenre || '', sections: timing.sections, vocalSpans, drumLevel, keysLevel }, stems: stems || undefined });
   if (!stage.ok) throw new PipelineError('musical_render_failed', `Musical stage render failed: ${stage.reason || 'unknown error'}`);
   const outDur = await probeDuration(OUTPUT_VIDEO);
   if (outDur < 5) throw new PipelineError('musical_render_failed', `Rendered musical video is only ${outDur.toFixed(1)}s long.`);
