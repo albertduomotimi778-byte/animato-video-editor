@@ -2677,6 +2677,81 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Pexels video clips for stories and ads (blended with the still pictures)
+// ---------------------------------------------------------------------------
+/** Stock footage that fits what the narrator is saying in a scene (Pexels videos API; needs PEXELS_API_KEY). */
+async function pexelsVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string }[]> {
+  if (!CFG.pexelsKey || !query.trim()) return [];
+  const q = encodeURIComponent(query.trim());
+  const d = await fetchJson(`https://api.pexels.com/videos/search?query=${q}&per_page=8&orientation=${orientation}&size=medium`, { Authorization: CFG.pexelsKey });
+  const out: { id: number; url: string; credit: string; attribution: string }[] = [];
+  for (const v of d?.videos || []) {
+    const files = (v.video_files || []).filter((f: any) => f?.link && /mp4/i.test(String(f.file_type || '')) && f.width && f.height);
+    if (!files.length || Number(v.duration) < 3) continue;
+    // About 720 px on the short side is plenty (smaller download, quicker to seek in the renderer).
+    const short = (f: any) => Math.min(f.width, f.height);
+    const best = files.slice().sort((a: any, b: any) => Math.abs(short(a) - 720) - Math.abs(short(b) - 720))[0];
+    out.push({ id: Number(v.id), url: best.link, credit: `Video: ${String(v.user?.name || 'Pexels').slice(0, 24)} · Pexels`, attribution: `Video by ${v.user?.name || 'unknown'} on Pexels (Pexels License) — ${v.url || 'https://www.pexels.com'}` });
+  }
+  return out;
+}
+
+/**
+ * Stories and ads: after the script is written, find a short video clip for most scenes so the picture
+ * moves with the narration. The still image stays as the fallback (and as the poster frame).
+ * Returns one prepared clip (silent, H.264, cropped to the frame) per scene, or null.
+ */
+async function gatherSceneVideos(script: Script, times: { start: number; end: number }[], images: (string | null)[]): Promise<(string | null)[]> {
+  const n = script.scenes.length;
+  const clips: (string | null)[] = new Array(n).fill(null);
+  if (CFG.category !== 'stories' && CFG.category !== 'ads') return clips;
+  if (!CFG.pexelsKey) { log('Scene videos: no Pexels key (PEXELS_API_KEY) — using pictures only.'); return clips; }
+  const deadline = Date.now() + 3 * 60 * 1000;
+  const used = new Set<number>();
+  const attributions: string[] = Array.isArray(script.imageAttributions) ? script.imageAttributions : [];
+  const STOP = new Set(['the', 'and', 'with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'was', 'were', 'his', 'her', 'she', 'him', 'for', 'but', 'not', 'all', 'one', 'had', 'has', 'have', 'who', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time']);
+  const kw = (t: string, k: number) => String(t || '').replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w.toLowerCase())).slice(0, k).join(' ');
+  const topic = kw((script.title || '').replace(/\s*\(part \d+\)\s*$/i, ''), 4);
+  const cw = Math.round(W * Math.min(1, 720 / Math.min(W, H)) / 2) * 2, ch = Math.round(H * Math.min(1, 720 / Math.min(W, H)) / 2) * 2;
+  // Two of every three scenes are footage, the rest stay pictures: a real blend, not a slideshow of clips.
+  const wanted = script.scenes.map((_, i) => i % 3 !== 2);
+  const fitOne = async (i: number) => {
+    if (!wanted[i]) return;
+    const s = script.scenes[i];
+    const len = Math.max(1.5, (times[i]?.end ?? 0) - (times[i]?.start ?? 0)) + 0.7;
+    const queries = Array.from(new Set([kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4), kw(s.narration, 3), topic].filter(Boolean)));
+    for (const query of queries) {
+      if (Date.now() > deadline) return;
+      for (const v of (await pexelsVideos(query)).slice(0, 4)) {
+        if (used.has(v.id)) continue;
+        const raw = path.join(WORK_DIR, `scene_${i}_raw.mp4`), clip = path.join(WORK_DIR, `scene_${i}.mp4`);
+        if (!(await download(v.url, raw, 60000))) continue;
+        const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1', '-i', raw, '-t', len.toFixed(2),
+          '-vf', `scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},fps=${FPS},setsar=1`,
+          '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', clip], { timeoutMs: 120000 });
+        try { fs.rmSync(raw, { force: true }); } catch {}
+        if (r.code !== 0 || !fs.existsSync(clip) || (await probeDuration(clip)) < 1) continue;
+        used.add(v.id);
+        clips[i] = clip;
+        // No usable still for this scene? The clip's first frame becomes the picture (and the fallback).
+        if (!images[i]) {
+          const jpg = path.join(WORK_DIR, `scene_${i}.jpg`);
+          if (await toJpeg(clip, jpg)) images[i] = jpg;
+        }
+        if (!attributions.includes(v.attribution)) attributions.push(v.attribution);
+        return;
+      }
+    }
+  };
+  let done = 0;
+  const queue = script.scenes.map((_, i) => i);
+  await Promise.all(Array.from({ length: 3 }, async () => { while (queue.length) { await fitOne(queue.shift()!); done++; } }));
+  script.imageAttributions = attributions;
+  log(`Scene videos: ${clips.filter(Boolean).length} clip(s) found for ${n} scenes (${done} searched) — the rest stay pictures.`);
+  return clips;
+}
+
+// ---------------------------------------------------------------------------
 // 4. Character rig from the app (the character designed in the editor)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -2790,7 +2865,7 @@ function audioArgs(narration: string, music: string | null, firstInput: number):
 
 async function renderWithStage(opts: {
   narration: Narration; scenes: Scene[]; times: { start: number; end: number }[]; cues: { t: number; tag: string }[]; images: (string | null)[];
-  title: string; badge: string; endCard: string; music: string | null; duration: number; credits?: (string | null)[]; musicalStage?: boolean; chorusIntervals?: { start: number; end: number }[];
+  title: string; badge: string; endCard: string; music: string | null; duration: number; credits?: (string | null)[]; videos?: (string | null)[]; musicalStage?: boolean; chorusIntervals?: { start: number; end: number }[];
   /** Override the canvas the stage renders at (used for ads that render landscape then get framed into a Short — see adLandscapeShort). Defaults to the job's actual frame. */
   size?: { w: number; h: number };
   musical?: { mood?: string; stageId?: number; stageAutoSeed?: string; style?: string; sections?: { start: number; end: number; tag: string; emotion?: string }[]; vocalSpans?: { start: number; end: number }[]; drumLevel?: number; keysLevel?: number };
@@ -2812,7 +2887,7 @@ async function renderWithStage(opts: {
     words: opts.narration.words.map((w) => ({ text: w.text, start: +w.start.toFixed(3), end: +w.end.toFixed(3), ...(typeof w.line === 'number' ? { line: w.line } : {}) })),
     ...(opts.lyrics ? { lyrics: opts.lyrics } : {}),
     wordsReliable: opts.narration.wordsReliable,
-    segments: opts.scenes.map((s, i) => ({ start: opts.times[i].start, end: opts.times[i].end, text: s.narration, image: opts.images[i] ? `/img/${path.basename(opts.images[i]!)}` : null, shot: s.shot, emotion: s.emotion, credit: opts.credits?.[i] || null })),
+    segments: opts.scenes.map((s, i) => ({ start: opts.times[i].start, end: opts.times[i].end, text: s.narration, image: opts.images[i] ? `/img/${path.basename(opts.images[i]!)}` : null, ...(opts.videos?.[i] ? { video: `/vid/${path.basename(opts.videos[i]!)}` } : {}), shot: s.shot, emotion: s.emotion, credit: opts.credits?.[i] || null })),
     cues: opts.cues,
     musicalStage: !!opts.musicalStage,
     chorusIntervals: opts.chorusIntervals || [],
@@ -2870,7 +2945,7 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
   const ffDone = new Promise<number>((resolve) => ff.on('close', (code: number | null) => resolve(code ?? -1)));
   ff.stdin.on('error', () => {});
 
-  const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json', '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.gif': 'image/gif', '.ttf': 'font/ttf', '.mp3': 'audio/mpeg', '.wav': 'audio/wav' };
+  const types: Record<string, string> = { '.mp4': 'video/mp4', '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json', '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.gif': 'image/gif', '.ttf': 'font/ttf', '.mp3': 'audio/mpeg', '.wav': 'audio/wav' };
   const serveFile = (res: any, file: string) => {
     if (!fs.existsSync(file)) { res.writeHead(404); res.end(); return; }
     res.writeHead(200, { 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-store' });
@@ -2891,7 +2966,7 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
       if (p === '/stage.js') return serveFile(res, stageJs);
       if (p === '/job.json') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(job)); return; }
       if (p === '/font/Poppins-Bold.ttf') return serveFile(res, path.join(HERE, 'assets/fonts/Poppins-Bold.ttf'));
-      if (p.startsWith('/img/')) return serveFile(res, path.join(WORK_DIR, path.basename(p)));
+      if (p.startsWith('/img/') || p.startsWith('/vid/')) return serveFile(res, path.join(WORK_DIR, path.basename(p)));
       if (opts.files[p]) return serveFile(res, opts.files[p]);
       res.writeHead(404); res.end(); return;
     }
@@ -4629,7 +4704,7 @@ async function produceStudio(t0: number): Promise<number> {
 
   // ---- A talking character (with pictures behind): talk, story, kids, news, cooking, tech, ads ----
   // A story is pictures + voice-over unless the user added a storyteller.
-  CFG.noCharacter = S.kind === 'story' && !S.showCharacter;
+  CFG.noCharacter = S.kind === 'story';   // stories never show a presenter
   CFG.category = ({ story: 'stories', kids: 'stories', talk: 'tech', motivation: 'tech', news: 'news', cooking: 'cooking', tech: 'tech', ads: 'ads' } as Record<string, string>)[S.kind] || 'tech';
   if (S.kind === 'ads') {
     CFG.adBrief = [String(S.adBrief || '').slice(0, 12000), S.adWebsiteUrl ? `Official website: ${S.adWebsiteUrl}` : ''].filter(Boolean).join('\n\n').slice(0, 14000);
@@ -4665,9 +4740,10 @@ async function produceStudio(t0: number): Promise<number> {
   await reportStatus('running', 'Finding pictures for the scenes', 45, `${script.scenes.length} scenes.`);
   const [{ files: images, credits }, generatedMusic] = await Promise.all([gatherImages(script), S.musicMode === 'none' || S.musicMode === 'upload' ? Promise.resolve(null as string | null) : findMusic(duration, narration)]);
   const music = generatedMusic;
+  const sceneVideos = await gatherSceneVideos(script, times, images);
   await reportStatus('running', 'Animating your character', 62, 'Animating.');
   const badge = S.kind === 'kids' ? 'KIDS' : S.kind === 'story' ? 'STORY' : S.kind === 'talk' || S.kind === 'motivation' ? '' : S.kind.toUpperCase();
-  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title: script.title, badge, endCard: S.watermark ? 'Made with Animato Studio Pro' : '', music, duration, credits });
+  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title: script.title, badge, endCard: S.watermark ? 'Made with Animato Studio Pro' : '', music, duration, credits, videos: sceneVideos });
   if (!stage.ok) {
     log(`⚠️ Character renderer unavailable (${stage.reason}).`);
     await renderFallback({ narration, times, images: images as string[], title: script.title, badge, music, duration });
@@ -4778,6 +4854,7 @@ async function main() {
   // 1. Script
   const script = await generateScript(pastStory, pastTitles, pastSources);
   polishMetadata(script);
+  if (CFG.category === 'stories') CFG.noCharacter = true;   // stories: voice-over + captions over pictures and video, never a presenter
   if (CFG.noCharacter) for (const sc of script.scenes) sc.shot = 'full';   // pictures fill the frame; no presenter
   log(`Metadata: ${script.description.split(/\s+/).length}-word description, hashtags: ${script.hashtags.map((h) => `#${h}`).join(' ')}`);
   if (script.usedFallbackTemplate && !CFG.allowFallbackPublish) {
@@ -4801,6 +4878,7 @@ async function main() {
 
   // 3. Images, character rig, music
   const [{ files: images, aiCount, credits }, music] = await Promise.all([imagesPromise, findMusic(duration, narration)]);
+  const sceneVideos = await gatherSceneVideos(script, times, images);
   const presenter = CFG.characterSpec ? `${CFG.characterSpec.name || 'custom'} (designed in the app)` : `default ${CFG.gender} presenter`;
   await reportStatus('running', '4/5 Rendering the video', 58, `${images.filter(Boolean).length} scene images ready; character: ${presenter}.`);
 
@@ -4818,7 +4896,7 @@ async function main() {
   // the same way a landscape podcast is framed into a Short (see landscapeIntoFrame).
   const adLandscapeShort = CFG.category === 'ads' && IS_SHORTS;
   const renderSize = adLandscapeShort ? { w: 1920, h: 1080 } : undefined;
-  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title, badge, endCard, music, duration, credits, size: renderSize });
+  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title, badge, endCard, music, duration, credits, videos: sceneVideos, size: renderSize });
   let characterMode = stage.character;
   if (!stage.ok) {
     log(`⚠️ Character renderer unavailable (${stage.reason}). Rendering scenes + captions without the character.`);
