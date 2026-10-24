@@ -602,7 +602,7 @@ const clampNum = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v)
 // ---------------------------------------------------------------------------
 /** A performance cue placed before the `index`-th spoken word of a scene. */
 interface Cue { index: number; tag: string }
-interface Scene { narration: string; shot: 'scene' | 'panel' | 'full'; emotion: string; imagePrompt: string; searchQuery: string; cues: Cue[]; productShot?: boolean; imageCredit?: string }
+interface Scene { narration: string; shot: 'scene' | 'panel' | 'full'; emotion: string; imagePrompt: string; searchQuery: string; videoQuery?: string; cues: Cue[]; productShot?: boolean; imageCredit?: string }
 
 // ---------------------------------------------------------------------------
 // Performance tags: the script writer places [tags] inside the narration right
@@ -959,7 +959,8 @@ ${arcStep}
 - Short spoken sentences, past tense, plain words. Keep the viewer feeling it: sounds, smells, small physical details.
 ${part >= last ? '- The title must NOT contain "(Part ...)" if the story ends here; instead make it the story\'s own title.' : `- Title must end with "(Part ${part})".`}
 - Also return "premise": 2-3 sentences of what this story is about, who is in it and what has happened so far (the next part is written from this), and "characters": each named person's fixed look (age, build, hair, clothes) for the pictures.
-- imagePrompt: describe the exact moment of that scene as a still from a high-end 3D animated family film (big-studio feature quality) — WHO (named character as an ORIGINAL stylised cartoon character + their fixed look; never an existing movie character), WHERE (a cartoon version of the place), WHAT is happening, the light and the camera angle. Every person is a cartoon character with big expressive eyes and soft rounded features — never a real or photorealistic human. FRAMING (important — the image model draws faces and torsos well but mangles hands, full-body action and crowds): frame every scene as a medium shot or close-up of ONE or TWO characters, waist-up or head-and-shoulders, in a calm simple pose (standing, sitting, talking, looking), hands low or out of frame; put the story's action and place in the background and props. Never full-body running / jumping / fighting poses, never crowds or groups, never close-ups of fingers.`;
+- imagePrompt: describe the exact moment of that scene as a still from a high-end 3D animated family film (big-studio feature quality) — WHO (named character as an ORIGINAL stylised cartoon character + their fixed look; never an existing movie character), WHERE (a cartoon version of the place), WHAT is happening, the light and the camera angle. Every person is a cartoon character with big expressive eyes and soft rounded features — never a real or photorealistic human. FRAMING (important — the image model draws faces and torsos well but mangles hands, full-body action and crowds): frame every scene as a medium shot or close-up of ONE or TWO characters, waist-up or head-and-shoulders, in a calm simple pose (standing, sitting, talking, looking), hands low or out of frame; put the story's action and place in the background and props. Never full-body running / jumping / fighting poses, never crowds or groups, never close-ups of fingers.
+- videoQuery (every scene): 2-4 plain words describing REAL FOOTAGE that matches what is happening at that moment, as you would type it into a stock-video site: the place, the action and the mood (night village rain, man running dark street, old house door opening, woman crying window). Real-world places, weather, objects and people seen from behind or in silhouette work best; never character names, never abstract words.`;
     }
   }
 }
@@ -1004,7 +1005,7 @@ Return ONLY this JSON (no markdown):
   "officialUrl": "tech/tutorials: the official website of the product (real URL only), else empty",
   "premise": "stories only: 2-3 sentences — who this story is about, where, and everything that has happened so far",
   "scenes": [
-    { "narration": "[emotion] spoken words with [gesture] tags where they land", "shot": "scene|panel|full", "emotion": "main emotion of the scene", "imagePrompt": "stories only: what the scene shows", "searchQuery": "stories: 2-4 words to find a matching CARTOON ILLUSTRATION (main subject + setting, e.g. \"fox forest night\"); everything else: real things to find a real photo of (names of people, products, places, dishes)", "productShot": false }
+    { "narration": "[emotion] spoken words with [gesture] tags where they land", "shot": "scene|panel|full", "emotion": "main emotion of the scene", "imagePrompt": "stories only: what the scene shows", "searchQuery": "stories: 2-4 words to find a matching CARTOON ILLUSTRATION (main subject + setting, e.g. \"fox forest night\"); everything else: real things to find a real photo of (names of people, products, places, dishes)", "videoQuery": "stories only: 2-4 words to find REAL STOCK FOOTAGE of this exact moment (the place, the action and the mood, e.g. night village rain, woman crying window, empty school corridor)", "productShot": false }
   ]
 }`;
 }
@@ -1225,6 +1226,7 @@ function normaliseScript(parsed: any, model: string, relaxed = false): Script {
         emotion: String(s?.emotion || 'neutral').toLowerCase().slice(0, 20),
         imagePrompt: String(s?.imagePrompt || s?.visual || '').trim().slice(0, 400),
         searchQuery: String(s?.searchQuery || '').replace(/[^\w\s'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80),
+        videoQuery: String(s?.videoQuery || '').replace(/[^\w\s'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60),
         productShot: s?.productShot === true || s?.product === true
       };
     })
@@ -1452,7 +1454,7 @@ async function sceneByScene(system: string, prompt: string): Promise<any | null>
   const [wlo, whi] = String(L.words).split('-').map((x) => parseInt(x, 10));
   const per = Math.max(12, Math.round(((wlo || L.minWords) + (whi || L.maxWords)) / 2 / n));
   let plan: any = null;
-  const planUser = `${prompt}\n\nFIRST, ONLY PLAN THE VIDEO. Return ONE JSON object: {"title": "", "description": "2-3 sentences", "hashtags": ["5-8 without #"], "tags": ["5-10"], "visualStyle": "", "characters": "", "scenes": [{"beat": "what this scene says or shows, one line", "shot": "scene|panel|full", "emotion": "neutral", "imagePrompt": "", "searchQuery": ""}]} with EXACTLY ${n} scenes that build to a strong ending.`;
+  const planUser = `${prompt}\n\nFIRST, ONLY PLAN THE VIDEO. Return ONE JSON object: {"title": "", "description": "2-3 sentences", "hashtags": ["5-8 without #"], "tags": ["5-10"], "visualStyle": "", "characters": "", "scenes": [{"beat": "what this scene says or shows, one line", "shot": "scene|panel|full", "emotion": "neutral", "imagePrompt": "", "searchQuery": "", "videoQuery": "stories only: 2-4 words of real stock footage matching this scene"}]} with EXACTLY ${n} scenes that build to a strong ending.`;
   for await (const a of LLM.attempts({ system, user: planUser, temperature: 0.8, maxTokens: 3000, json: true, timeoutMs: 120000, task: 'script_plan' })) {
     try { const j = extractJson(a.text); if (Array.isArray(j?.scenes) && j.scenes.length >= Math.ceil(n * 0.7) && j.title) { plan = j; break; } } catch {}
   }
@@ -1469,7 +1471,7 @@ async function sceneByScene(system: string, prompt: string): Promise<any | null>
       if (t.split(' ').length >= 6) { text = t; break; }
     }
     if (!text) continue;
-    out.push({ narration: text, shot: sc.shot, emotion: sc.emotion, imagePrompt: sc.imagePrompt || sc.beat, searchQuery: sc.searchQuery });
+    out.push({ narration: text, shot: sc.shot, emotion: sc.emotion, imagePrompt: sc.imagePrompt || sc.beat, searchQuery: sc.searchQuery, videoQuery: String(sc.videoQuery || '').slice(0, 60) });
   }
   if (out.length < Math.ceil(n * 0.6)) return null;
   return { ...plan, scenes: out };
@@ -2696,6 +2698,27 @@ async function pexelsVideos(query: string): Promise<{ id: number; url: string; c
   return out;
 }
 
+/** Pixabay footage (second source, used when Pexels has nothing that fits). Needs PIXABAY_API_KEY. */
+async function pixabayVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string }[]> {
+  if (!CFG.pixabayKey || !query.trim()) return [];
+  const d = await fetchJson(`https://pixabay.com/api/videos/?key=${encodeURIComponent(CFG.pixabayKey)}&q=${encodeURIComponent(query.trim())}&per_page=8&safesearch=true`);
+  const out: { id: number; url: string; credit: string; attribution: string }[] = [];
+  for (const v of d?.hits || []) {
+    const f = v?.videos?.medium?.url ? v.videos.medium : v?.videos?.small?.url ? v.videos.small : v?.videos?.large;
+    if (!f?.url || Number(v.duration) < 3) continue;
+    // Offset the id so a Pixabay clip can never collide with a Pexels one in the "already used" set.
+    out.push({ id: 1_000_000_000 + Number(v.id), url: f.url, credit: `Video: ${String(v.user || 'Pixabay').slice(0, 24)} · Pixabay`, attribution: `Video by ${v.user || 'unknown'} on Pixabay (Pixabay License) — ${v.pageURL || 'https://pixabay.com'}` });
+  }
+  return out;
+}
+/** Footage for one search phrase, from every source that has a key. */
+async function stockVideos(query: string) {
+  const [a, b] = await Promise.all([pexelsVideos(query).catch(() => []), pixabayVideos(query).catch(() => [])]);
+  const out: typeof a = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) { if (a[i]) out.push(a[i]); if (b[i]) out.push(b[i]); }
+  return out;
+}
+
 /**
  * Stories and ads: after the script is written, find a short video clip for most scenes so the picture
  * moves with the narration. The still image stays as the fallback (and as the poster frame).
@@ -2705,24 +2728,39 @@ async function gatherSceneVideos(script: Script, times: { start: number; end: nu
   const n = script.scenes.length;
   const clips: (string | null)[] = new Array(n).fill(null);
   if (CFG.category !== 'stories' && CFG.category !== 'ads') return clips;
-  if (!CFG.pexelsKey) { log('Scene videos: no Pexels key (PEXELS_API_KEY) — using pictures only.'); return clips; }
-  const deadline = Date.now() + 3 * 60 * 1000;
+  if (!CFG.pexelsKey && !CFG.pixabayKey) { log('Scene videos: no Pexels or Pixabay key (PEXELS_API_KEY / PIXABAY_API_KEY) — using pictures only.'); return clips; }
+  // Detect which stock keys actually work (an invalid one is dropped so it never slows the search down).
+  for (const k of ['pexels', 'pixabay'] as const) {
+    const key = k === 'pexels' ? CFG.pexelsKey : CFG.pixabayKey;
+    if (!key) continue;
+    try {
+      const r = await fetch(k === 'pexels' ? 'https://api.pexels.com/videos/search?query=sea&per_page=1' : `https://pixabay.com/api/videos/?key=${encodeURIComponent(key)}&q=sea&per_page=3`, { headers: k === 'pexels' ? { Authorization: key } : {}, signal: AbortSignal.timeout(8000) });
+      if (r.status === 401 || r.status === 403 || (k === 'pixabay' && r.status === 400)) { log(`Scene videos: the ${k} key was rejected (${r.status}) — not using it.`); if (k === 'pexels') CFG.pexelsKey = ''; else CFG.pixabayKey = ''; }
+      else log(`Scene videos: ${k} key found and working.`);
+    } catch { log(`Scene videos: could not check the ${k} key right now — trying it anyway.`); }
+  }
+  if (!CFG.pexelsKey && !CFG.pixabayKey) { log('Scene videos: no working stock key — using pictures only.'); return clips; }
+  const isStory = CFG.category === 'stories';
+  const deadline = Date.now() + (isStory ? 6 : 3) * 60 * 1000;
   const used = new Set<number>();
   const attributions: string[] = Array.isArray(script.imageAttributions) ? script.imageAttributions : [];
   const STOP = new Set(['the', 'and', 'with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'was', 'were', 'his', 'her', 'she', 'him', 'for', 'but', 'not', 'all', 'one', 'had', 'has', 'have', 'who', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time']);
   const kw = (t: string, k: number) => String(t || '').replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w.toLowerCase())).slice(0, k).join(' ');
   const topic = kw((script.title || '').replace(/\s*\(part \d+\)\s*$/i, ''), 4);
   const cw = Math.round(W * Math.min(1, 720 / Math.min(W, H)) / 2) * 2, ch = Math.round(H * Math.min(1, 720 / Math.min(W, H)) / 2) * 2;
-  // Two of every three scenes are footage, the rest stay pictures: a real blend, not a slideshow of clips.
-  const wanted = script.scenes.map((_, i) => i % 3 !== 2);
+  // Stories: every scene gets footage that fits what the narrator says, cut together into one moving film.
+  // Ads keep a blend (two of every three scenes are footage, the rest stay pictures).
+  const wanted = script.scenes.map((_, i) => isStory || i % 3 !== 2);
   const fitOne = async (i: number) => {
     if (!wanted[i]) return;
     const s = script.scenes[i];
     const len = Math.max(1.5, (times[i]?.end ?? 0) - (times[i]?.start ?? 0)) + 0.7;
-    const queries = Array.from(new Set([kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4), kw(s.narration, 3), topic].filter(Boolean)));
+    const queries = Array.from(new Set((isStory
+      ? [kw(s.videoQuery || '', 4), kw((s.videoQuery || '').split(/\s+/).slice(0, 2).join(' '), 2), kw(s.searchQuery || '', 4), kw(s.narration, 3), kw(s.imagePrompt || '', 4), topic]
+      : [kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4), kw(s.narration, 3), topic]).filter(Boolean)));
     for (const query of queries) {
       if (Date.now() > deadline) return;
-      for (const v of (await pexelsVideos(query)).slice(0, 4)) {
+      for (const v of (await stockVideos(query)).slice(0, isStory ? 6 : 4)) {
         if (used.has(v.id)) continue;
         const raw = path.join(WORK_DIR, `scene_${i}_raw.mp4`), clip = path.join(WORK_DIR, `scene_${i}.mp4`);
         if (!(await download(v.url, raw, 60000))) continue;
