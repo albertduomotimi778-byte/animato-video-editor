@@ -31,6 +31,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { LlmPool, extractJsonObject, createRelay, splitKeys } from './llm.ts';
 import { researchNews, bingNews, researchRecipe, factSheet, unsupportedNumbers, visionMatches, visionAnatomy, metadataMatches, identifierTokens, type FactPack, type ResearchCtx } from './research.ts';
+import { stripScriptDirections } from './scriptClean.ts';
 import { composeBuffers, eqForVoice, automateLevel, levelDb, encodeWav, moodFor } from './music.ts';
 import { runAnimated, ANIM_CATEGORIES } from './anim/runner.ts';
 
@@ -960,7 +961,7 @@ ${arcStep}
 ${part >= last ? '- The title must NOT contain "(Part ...)" if the story ends here; instead make it the story\'s own title.' : `- Title must end with "(Part ${part})".`}
 - Also return "premise": 2-3 sentences of what this story is about, who is in it and what has happened so far (the next part is written from this), and "characters": each named person's fixed look (age, build, hair, clothes) for the pictures.
 - imagePrompt: describe the exact moment of that scene as a still from a high-end 3D animated family film (big-studio feature quality) — WHO (named character as an ORIGINAL stylised cartoon character + their fixed look; never an existing movie character), WHERE (a cartoon version of the place), WHAT is happening, the light and the camera angle. Every person is a cartoon character with big expressive eyes and soft rounded features — never a real or photorealistic human. FRAMING (important — the image model draws faces and torsos well but mangles hands, full-body action and crowds): frame every scene as a medium shot or close-up of ONE or TWO characters, waist-up or head-and-shoulders, in a calm simple pose (standing, sitting, talking, looking), hands low or out of frame; put the story's action and place in the background and props. Never full-body running / jumping / fighting poses, never crowds or groups, never close-ups of fingers.
-- videoQuery (every scene): 2-4 plain words describing REAL FOOTAGE that matches what is happening at that moment, as you would type it into a stock-video site: the place, the action and the mood (night village rain, man running dark street, old house door opening, woman crying window). Real-world places, weather, objects and people seen from behind or in silhouette work best; never character names, never abstract words.`;
+- videoQuery (every scene): 2-4 plain words describing REAL FOOTAGE that matches what is happening at that moment AND how it feels. The footage must be in line with the storyline, the scene and the words being spoken: a sad or painful scene gets quiet, sombre footage (woman crying window, empty room night, rain on glass), NEVER dancing, parties or laughing crowds; a happy scene gets warm, joyful footage. Describe it as as you would type it into a stock-video site: the place, the action and the mood (night village rain, man running dark street, old house door opening, woman crying window). Real-world places, weather, objects and people seen from behind or in silhouette work best; never character names, never abstract words.`;
     }
   }
 }
@@ -2682,32 +2683,32 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
 // 3b. Pexels video clips for stories and ads (blended with the still pictures)
 // ---------------------------------------------------------------------------
 /** Stock footage that fits what the narrator is saying in a scene (Pexels videos API; needs PEXELS_API_KEY). */
-async function pexelsVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string }[]> {
+async function pexelsVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string; desc: string }[]> {
   if (!CFG.pexelsKey || !query.trim()) return [];
   const q = encodeURIComponent(query.trim());
   const d = await fetchJson(`https://api.pexels.com/videos/search?query=${q}&per_page=8&orientation=${orientation}&size=medium`, { Authorization: CFG.pexelsKey });
-  const out: { id: number; url: string; credit: string; attribution: string }[] = [];
+  const out: { id: number; url: string; credit: string; attribution: string; desc: string }[] = [];
   for (const v of d?.videos || []) {
     const files = (v.video_files || []).filter((f: any) => f?.link && /mp4/i.test(String(f.file_type || '')) && f.width && f.height);
     if (!files.length || Number(v.duration) < 3) continue;
     // About 720 px on the short side is plenty (smaller download, quicker to seek in the renderer).
     const short = (f: any) => Math.min(f.width, f.height);
     const best = files.slice().sort((a: any, b: any) => Math.abs(short(a) - 720) - Math.abs(short(b) - 720))[0];
-    out.push({ id: Number(v.id), url: best.link, credit: `Video: ${String(v.user?.name || 'Pexels').slice(0, 24)} · Pexels`, attribution: `Video by ${v.user?.name || 'unknown'} on Pexels (Pexels License) — ${v.url || 'https://www.pexels.com'}` });
+    out.push({ id: Number(v.id), url: best.link, desc: String(v.url || '').replace(/^.*\/video\//, '').replace(/-\d+\/?$/, '').replace(/[-_/]+/g, ' ').toLowerCase(), credit: `Video: ${String(v.user?.name || 'Pexels').slice(0, 24)} · Pexels`, attribution: `Video by ${v.user?.name || 'unknown'} on Pexels (Pexels License) — ${v.url || 'https://www.pexels.com'}` });
   }
   return out;
 }
 
 /** Pixabay footage (second source, used when Pexels has nothing that fits). Needs PIXABAY_API_KEY. */
-async function pixabayVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string }[]> {
+async function pixabayVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string; desc: string }[]> {
   if (!CFG.pixabayKey || !query.trim()) return [];
   const d = await fetchJson(`https://pixabay.com/api/videos/?key=${encodeURIComponent(CFG.pixabayKey)}&q=${encodeURIComponent(query.trim())}&per_page=8&safesearch=true`);
-  const out: { id: number; url: string; credit: string; attribution: string }[] = [];
+  const out: { id: number; url: string; credit: string; attribution: string; desc: string }[] = [];
   for (const v of d?.hits || []) {
     const f = v?.videos?.medium?.url ? v.videos.medium : v?.videos?.small?.url ? v.videos.small : v?.videos?.large;
     if (!f?.url || Number(v.duration) < 3) continue;
     // Offset the id so a Pixabay clip can never collide with a Pexels one in the "already used" set.
-    out.push({ id: 1_000_000_000 + Number(v.id), url: f.url, credit: `Video: ${String(v.user || 'Pixabay').slice(0, 24)} · Pixabay`, attribution: `Video by ${v.user || 'unknown'} on Pixabay (Pixabay License) — ${v.pageURL || 'https://pixabay.com'}` });
+    out.push({ id: 1_000_000_000 + Number(v.id), url: f.url, desc: String(v.tags || '').replace(/[,]+/g, ' ').toLowerCase(), credit: `Video: ${String(v.user || 'Pixabay').slice(0, 24)} · Pixabay`, attribution: `Video by ${v.user || 'unknown'} on Pixabay (Pixabay License) — ${v.pageURL || 'https://pixabay.com'}` });
   }
   return out;
 }
@@ -2717,6 +2718,52 @@ async function stockVideos(query: string) {
   const out: typeof a = [];
   for (let i = 0; i < Math.max(a.length, b.length); i++) { if (a[i]) out.push(a[i]); if (b[i]) out.push(b[i]); }
   return out;
+}
+
+/**
+ * Does a stock clip fit the scene? Pexels gives the clip's description in its page address and Pixabay gives tags,
+ * so each candidate is scored against what the scene is about (the search words and the narration) and against its
+ * FEELING: a heartbreaking scene never gets people dancing, a joyful one never gets a funeral.
+ */
+const HEAVY_EMO = /^(sad|crying|worried|scared|angry|serious)$/;
+const LIGHT_EMO = /^(happy|excited|laugh)$/;
+const HEAVY_TEXT = /\b(cry|cried|crying|tears?|weep|wept|sob|grief|griev|mourn|funeral|buried|died|death|dead|lost|loss|pain|hurt|heartbr|humiliat|abandon|alone|lonely|afraid|fear|scared|terrif|danger|threat|angry|anger|shout|slap|beat|blood|sick|illness|hospital|accident|betray|cruel|barren|silent|sorrow|regret|worthless|ashamed|shame)\w*/i;
+const LIGHT_TEXT = /\b(laugh|laughter|joy|joyful|happy|happiness|celebrat|party|dance|danced|dancing|wedding|birthday|cheer|smil|giggl|delight|festival|surprise party|triumph|victory)\w*/i;
+const CLASH_FOR_HEAVY = /\b(danc\w*|part(?:y|ies)|celebrat\w*|confetti|festival|club|disco|cheer\w*|laugh\w*|giggl\w*|smil\w*|playful|playing|joy\w*|happy|happiness|fun|wedding|birthday|carnival|fireworks|concert|karaoke|vacation|holiday|comedy|funny|bounc\w*|jump\w*|waving|selfie|thumbs up|toast|champagne|swimming|beach party|sunbathing|cartoon|animation)\b/i;
+const CLASH_FOR_LIGHT = /\b(funeral|grave\w*|cemetery|coffin|crying|cry|tears?|sad|sadness|grief|mourn\w*|depress\w*|lonely|loneliness|storm|war|fight\w*|argu\w*|angry|abuse|accident|crash|disaster|horror|scary|ghost|haunted|zombie|blood|prison|hospital bed)\b/i;
+const FIT_FOR_HEAVY = /\b(sad|cry\w*|tears?|alone|lonely|rain\w*|window|dark|night|dusk|silhouette|pensive|thoughtful|grief|candle|empty|shadow\w*|fog|mist|overcast|lonesome|worried|anxious|hands|praying|prayer|church|hospital|door|walking away)\b/i;
+const FIT_FOR_LIGHT = /\b(smil\w*|happy|laugh\w*|sun\w*|joy\w*|play\w*|celebrat\w*|garden|family|hug\w*|embrac\w*|children|child|kids|baby|warm|golden|bright)\b/i;
+
+function sceneFeeling(emotion: string, narration: string): 'heavy' | 'light' | 'neutral' {
+  const e = String(emotion || '').toLowerCase();
+  if (HEAVY_EMO.test(e)) return 'heavy';
+  if (LIGHT_EMO.test(e)) return 'light';
+  const h = (narration.match(new RegExp(HEAVY_TEXT.source, 'gi')) || []).length, l = (narration.match(new RegExp(LIGHT_TEXT.source, 'gi')) || []).length;
+  return h > l ? 'heavy' : l > h ? 'light' : 'neutral';
+}
+
+/** Lower-cased stems of the meaningful words in a text (4+ letters), for loose matching. */
+function stems(t: string): string[] {
+  const STOP = new Set(['with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'were', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time', 'have', 'been', 'would', 'could', 'should', 'about', 'after', 'before', 'while', 'because', 'every', 'never', 'still', 'only', 'even', 'much', 'many', 'some', 'came', 'went', 'said', 'asked', 'told']);
+  return Array.from(new Set(String(t || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length >= 4 && !STOP.has(w)).map((w) => w.slice(0, 5))));
+}
+
+/** -1 = this clip must not be used for the scene; otherwise a score, higher = fits better. */
+function clipFit(desc: string, scene: { videoQuery: string; narration: string; imagePrompt: string; emotion: string }): number {
+  const d = ` ${desc} `;
+  const feeling = sceneFeeling(scene.emotion, scene.narration);
+  const own = `${scene.narration} ${scene.videoQuery} ${scene.imagePrompt}`;
+  // A feeling word in the clip is fine only when the scene's own words say it too (e.g. a scene that really is about a party).
+  if (feeling === 'heavy' && CLASH_FOR_HEAVY.test(d) && !CLASH_FOR_HEAVY.test(own)) return -1;
+  if (feeling === 'light' && CLASH_FOR_LIGHT.test(d) && !CLASH_FOR_LIGHT.test(own)) return -1;
+  if (feeling === 'neutral' && (CLASH_FOR_HEAVY.test(d) || CLASH_FOR_LIGHT.test(d)) && !CLASH_FOR_HEAVY.test(own) && !CLASH_FOR_LIGHT.test(own)) return -1;
+  const dStems = new Set(stems(d));
+  const q = stems(scene.videoQuery), n = stems(scene.narration);
+  const qHit = q.filter((w) => dStems.has(w)).length, nHit = n.filter((w) => dStems.has(w)).length;
+  let score = qHit * 3 + nHit;
+  if (feeling === 'heavy' && FIT_FOR_HEAVY.test(d)) score += 2;
+  if (feeling === 'light' && FIT_FOR_LIGHT.test(d)) score += 2;
+  return score;
 }
 
 /**
@@ -2756,12 +2803,17 @@ async function gatherSceneVideos(script: Script, times: { start: number; end: nu
     const s = script.scenes[i];
     const len = Math.max(1.5, (times[i]?.end ?? 0) - (times[i]?.start ?? 0)) + 0.7;
     const queries = Array.from(new Set((isStory
-      ? [kw(s.videoQuery || '', 4), kw((s.videoQuery || '').split(/\s+/).slice(0, 2).join(' '), 2), kw(s.searchQuery || '', 4), kw(s.narration, 3), kw(s.imagePrompt || '', 4), topic]
+      ? [kw(s.videoQuery || '', 4), kw((s.videoQuery || '').split(/\s+/).slice(0, 2).join(' '), 2), kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4)]
       : [kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4), kw(s.narration, 3), topic]).filter(Boolean)));
+    const fitScene = { videoQuery: String(s.videoQuery || s.searchQuery || ''), narration: String(s.narration || '').replace(/\[[^\]]*\]/g, ' '), imagePrompt: String(s.imagePrompt || ''), emotion: String(s.emotion || '') };
+    // The first search words are the most specific; later ones are looser, so they must fit better to be accepted.
+    let qi = 0;
     for (const query of queries) {
       if (Date.now() > deadline) return;
-      for (const v of (await stockVideos(query)).slice(0, isStory ? 6 : 4)) {
-        if (used.has(v.id)) continue;
+      const need = qi++ === 0 ? 3 : 4;
+      const ranked = (await stockVideos(query)).filter((v) => !used.has(v.id))
+        .map((v) => ({ v, score: clipFit(v.desc, fitScene) })).filter((x) => x.score >= need).sort((a, b) => b.score - a.score);
+      for (const { v } of ranked.slice(0, isStory ? 4 : 3)) {
         const raw = path.join(WORK_DIR, `scene_${i}_raw.mp4`), clip = path.join(WORK_DIR, `scene_${i}.mp4`);
         if (!(await download(v.url, raw, 60000))) continue;
         const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1', '-i', raw, '-t', len.toFixed(2),
@@ -2785,7 +2837,7 @@ async function gatherSceneVideos(script: Script, times: { start: number; end: nu
   const queue = script.scenes.map((_, i) => i);
   await Promise.all(Array.from({ length: 3 }, async () => { while (queue.length) { await fitOne(queue.shift()!); done++; } }));
   script.imageAttributions = attributions;
-  log(`Scene videos: ${clips.filter(Boolean).length} clip(s) found for ${n} scenes (${done} searched) — the rest stay pictures.`);
+  log(`Scene videos: ${clips.filter(Boolean).length} clip(s) that fit the story found for ${n} scenes (${done} searched) — scenes with no clip that fits the words and the feeling keep their picture.`);
   return clips;
 }
 
@@ -4563,7 +4615,7 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   const adContext = S.kind === 'ads'
     ? String(S.adBrief || '').replace(/\s+/g, ' ').slice(0, 7000)
     : '';
-  let prompts: { imagePrompt: string; searchQuery: string; emotion: string; title?: string }[] = parts.map((p) => ({ imagePrompt: `${style}, ${p.slice(0, 220)}`, searchQuery: p.split(/\s+/).filter((w) => w.length > 4).slice(0, 4).join(' '), emotion: 'neutral' }));
+  let prompts: { imagePrompt: string; searchQuery: string; videoQuery?: string; emotion: string; title?: string }[] = parts.map((p) => ({ imagePrompt: `${style}, ${p.slice(0, 220)}`, searchQuery: p.split(/\s+/).filter((w) => w.length > 4).slice(0, 4).join(' '), emotion: 'neutral' }));
   // The script's own [tags], re-based onto each scene's words.
   const offsets: number[] = [];
   { let o = 0; for (const p of parts) { offsets.push(o); o += p.split(/\s+/).filter(Boolean).length; } }
@@ -4577,7 +4629,7 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
     const adInstruction = S.kind === 'ads'
       ? `AD CAMPAIGN CONTEXT (guide visuals only; do not invent claims or add facts to spoken narration):\n${adContext || 'No product PDF facts supplied; use the user script and any live official website screenshot only.'}\n`
       : '';
-    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).\n${adInstruction}SCENES:\n${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}\nReturn ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
+    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')})${S.kind === 'story' || S.kind === 'kids' ? ', plus "videoQuery": 2-4 plain words for REAL STOCK FOOTAGE of exactly what the narration says in that scene and in the SAME FEELING (a heartbreaking scene gets quiet sombre footage such as "woman crying window" or "rain on glass", never dancing or parties; a joyful scene gets warm joyful footage; no character names)' : ''}. Also give the video a catchy title (max 60 chars).\n${adInstruction}SCENES:\n${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}\nReturn ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
     for await (const a of LLM.attempts({ system: 'You are a storyboard artist for animated videos. You answer with one JSON object.', user, json: true, temperature: 0.7, maxTokens: 3000, timeoutMs: 90000, task: 'studio_storyboard' })) {
       try {
         const j = extractJsonObject(a.text);
@@ -4585,6 +4637,7 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
         prompts = parts.map((_, i) => ({
           imagePrompt: `${style}, ${String(j.scenes[i].imagePrompt || prompts[i].imagePrompt).slice(0, 400)}`,
           searchQuery: String(j.scenes[i].searchQuery || prompts[i].searchQuery).slice(0, 60),
+          videoQuery: String(j.scenes[i].videoQuery || '').replace(/[^\w\s'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60),
           emotion: EMOTION_TAGS.includes(String(j.scenes[i].emotion)) ? String(j.scenes[i].emotion) : 'neutral',
         }));
         if (!title && j.title) title = String(j.title).slice(0, 80);
@@ -4595,7 +4648,7 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   return {
     title: title || parts[0].split(/\s+/).slice(0, 7).join(' ').replace(/[.,!?]+$/, ''),
     description: '', hashtags: [], tags: [], visualStyle: style, characters: '', usedFallbackTemplate: false,
-    scenes: parts.map((p, i) => ({ narration: p, cues: [{ index: 0, tag: prompts[i].emotion }, ...sceneCues(i)], shot: i === 0 ? 'scene' : (i % 3 === 2 ? 'panel' : 'scene'), emotion: prompts[i].emotion, imagePrompt: prompts[i].imagePrompt, searchQuery: prompts[i].searchQuery })),
+    scenes: parts.map((p, i) => ({ narration: p, cues: [{ index: 0, tag: prompts[i].emotion }, ...sceneCues(i)], shot: i === 0 ? 'scene' : (i % 3 === 2 ? 'panel' : 'scene'), emotion: prompts[i].emotion, imagePrompt: prompts[i].imagePrompt, searchQuery: prompts[i].searchQuery, videoQuery: prompts[i].videoQuery || '' })),
   } as Script;
 }
 
@@ -4666,7 +4719,7 @@ async function produceStudio(t0: number): Promise<number> {
   if (S.kind === 'musical') {
     // The frame (9:16, 4:5 or 16:9) was chosen in the app and is already applied; the song stays a short one.
     CFG.category = 'musical'; CFG.format = 'shorts';
-    CFG.musicalLyrics = String(S.script || '').slice(0, 3000);
+    CFG.musicalLyrics = stripScriptDirections(String(S.script || ''), 'light').slice(0, 3000);
     CFG.musicLanguage = S.musicLanguage || 'English'; CFG.subGenre = S.subGenre || 'afrobeats';
     CFG.stageId = S.stageMode === 'fixed' ? (S.stageId || 0) : 0;
     CFG.topic = S.title || 'Original music video'; CFG.campaignName = S.title || 'Original music video';
@@ -4679,7 +4732,7 @@ async function produceStudio(t0: number): Promise<number> {
   // ---- One-off podcast from Tools (never an automation episode) ----
   if (S.kind === 'podcast') {
     CFG.category = 'podcast'; CFG.format = CFG.aspect === '16:9' ? 'video' : 'shorts';
-    CFG.podcastScript = String(S.script || '').slice(0, 8000);
+    CFG.podcastScript = stripScriptDirections(String(S.script || ''), 'light').slice(0, 8000);
     CFG.castSpecs = Array.isArray(S.podcastHosts) && S.podcastHosts.length ? S.podcastHosts : S.cast.map((c) => c.spec).filter(Boolean);
     CFG.studio = S.podcastStudio || CFG.studio;
     CFG.podcastCast = 'custom'; CFG.podcastCastCount = Math.max(1, Math.min(3, CFG.castSpecs.length || 2));
@@ -4754,7 +4807,7 @@ async function produceStudio(t0: number): Promise<number> {
   }
   let narration: Narration, text: string;
   // [tags] in the user's script (turns, gestures, emotions) are direction, never spoken.
-  const tagged = parseTaggedNarration(S.script || '');
+  const tagged = parseTaggedNarration(stripScriptDirections(S.script || '', CFG.category === 'stories' ? 'story' : 'light'));
   (CFG as any).studioCues = tagged.cues;
   if (S.voiceUrl) {
     ({ narration, text } = await studioVoice({ ...S, script: tagged.text }));
