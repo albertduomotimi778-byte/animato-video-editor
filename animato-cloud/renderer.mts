@@ -950,7 +950,7 @@ function categoryBrief(pastStory: string, headlines: { title: string; source: st
 - Deepen the danger and reveal something that changes how the viewer reads Part 1 (who is really behind it, what the protagonist did, what is at stake).
 - The protagonist must DO something, fail or half-succeed, and end the part in worse trouble than they started.`;
       return `FORMAT: a complete short story told by a NARRATOR in the THIRD PERSON — a real story with a plot, not a monologue${sub}${topic}${known}${cont}
-- The presenter is the storyteller and NEVER a character in it. Use names and he/she/they, never "I" for the protagonist.
+- The narrator is an unseen voice (no presenter appears on screen) and is NEVER a character in the story. Never introduce yourself by name or say "I'm ...". Use names and he/she/they, never "I" for the protagonist.
 - The whole story runs for EXACTLY ${last} parts and this is part ${part}.
 ${arcStep}
 - Tone: ${tone}.
@@ -969,8 +969,8 @@ ${part >= last ? '- The title must NOT contain "(Part ...)" if the story ends he
 function buildPrompt(pastStory: string, pastTitles: string[], headlines: any[], pack: FactPack | null = null): string {
   const L = lengthSpec();
   const avoid = pastTitles.length ? `\nPrevious video titles (do NOT repeat these topics): ${pastTitles.slice(-35).join(' | ')}` : '';
-  return `You are writing a ${IS_SHORTS ? 'YouTube Short (vertical)' : 'YouTube video (16:9)'} of ${L.seconds}, narrated by an animated presenter${CFG.presenterName ? ` called ${CFG.presenterName}` : ''}.
-${categoryBrief(pastStory, headlines, pack)}${avoid}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}` : ''}${CFG.presenterName ? `\nPRESENTER NAME: ${CFG.presenterName}. Whenever the presenter introduces themself or signs off, use this name (e.g. "Hi, I'm ${CFG.presenterName}") — never any other name.` : ''}
+  return `You are writing a ${IS_SHORTS ? 'YouTube Short (vertical)' : 'YouTube video (16:9)'} of ${L.seconds}, ${CFG.category === 'stories' ? 'narrated by an unseen voice-over narrator (no presenter or character appears on screen)' : `narrated by an animated presenter${CFG.presenterName ? ` called ${CFG.presenterName}` : ''}`}.
+${categoryBrief(pastStory, headlines, pack)}${avoid}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}` : ''}${CFG.presenterName && CFG.category !== 'stories' ? `\nPRESENTER NAME: ${CFG.presenterName}. Whenever the presenter introduces themself or signs off, use this name (e.g. "Hi, I'm ${CFG.presenterName}") — never any other name.` : ''}
 
 RULES
 - Total narration: ${L.words} words across ${L.scenes} scenes. Each scene is 1-3 spoken sentences (8-40 words).
@@ -4794,7 +4794,7 @@ async function produceStudio(t0: number): Promise<number> {
   }
 
   // ---- A talking character (with pictures behind): talk, story, kids, news, cooking, tech, ads ----
-  // A story is pictures + voice-over unless the user added a storyteller.
+  // A story is pictures + voice-over only: there is never a presenter or any character on screen.
   CFG.noCharacter = S.kind === 'story';   // stories never show a presenter
   CFG.category = ({ story: 'stories', kids: 'stories', talk: 'tech', motivation: 'tech', news: 'news', cooking: 'cooking', tech: 'tech', ads: 'ads' } as Record<string, string>)[S.kind] || 'tech';
   if (S.kind === 'ads') {
@@ -4970,7 +4970,7 @@ async function main() {
   // 3. Images, character rig, music
   const [{ files: images, aiCount, credits }, music] = await Promise.all([imagesPromise, findMusic(duration, narration)]);
   const sceneVideos = await gatherSceneVideos(script, times, images);
-  const presenter = CFG.characterSpec ? `${CFG.characterSpec.name || 'custom'} (designed in the app)` : `default ${CFG.gender} presenter`;
+  const presenter = CFG.noCharacter ? 'none (pictures + voice-over)' : CFG.characterSpec ? `${CFG.characterSpec.name || 'custom'} (designed in the app)` : `default ${CFG.gender} presenter`;
   await reportStatus('running', '4/5 Rendering the video', 58, `${images.filter(Boolean).length} scene images ready; character: ${presenter}.`);
 
   // 4. Render
